@@ -1,0 +1,8 @@
+Data/
+.tools/
+node_modules/
+.next/
+dist/
+.test-dist/
+package-lock.json
+docs/evidence/

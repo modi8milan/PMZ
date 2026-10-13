@@ -1,0 +1,17 @@
+{
+  "name": "@zenovel/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "migrate": "node run.mjs up",
+    "validate": "node run.mjs validate",
+    "check": "node run.mjs check"
+  },
+  "dependencies": {
+    "pg": "8.23.1",
+    "node-pg-migrate": "9.0.0",
+    "dotenv": "18.0.7",
+    "zod": "4.6.7"
+  }
+}

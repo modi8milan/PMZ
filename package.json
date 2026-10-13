@@ -1,0 +1,35 @@
+{
+  "name": "zenovel-foundation",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11 <12"
+  },
+  "packageManager": "npm@11.19.0",
+  "scripts": {
+    "dev:web": "npm run dev --workspace @zenovel/web",
+    "dev:api": "npm run dev --workspace @zenovel/api",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspace @zenovel/api",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:migrate": "npm run migrate --workspace @zenovel/database",
+    "db:validate": "npm run validate --workspace @zenovel/database",
+    "db:check": "npm run check --workspace @zenovel/database",
+    "verify:architecture": "node scripts/verify-architecture.mjs"
+  },
+  "devDependencies": {
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "eslint": "9.39.5",
+    "typescript-eslint": "8.71.2",
+    "@types/node": "24.19.2"
+  }
+}
