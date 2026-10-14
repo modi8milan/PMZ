@@ -17,6 +17,16 @@ const env = {
   RATE_LIMIT: '3',
   RATE_TTL_MS: '60000',
   NODE_ENV: 'test',
+  PASSWORD_EXPIRY_DAYS: '30',
+  PASSWORD_HISTORY_COUNT: '5',
+  SESSION_IDLE_MINUTES: '30',
+  SESSION_ABSOLUTE_HOURS: '8',
+  LOGIN_MAX_FAILURES: '5',
+  LOCKOUT_MINUTES: '15',
+  RESET_TOKEN_MINUTES: '30',
+  SESSION_COOKIE_NAME: 'zenovel_session',
+  MFA_ENCRYPTION_KEY: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=',
+  BOOTSTRAP_TOKEN: 'test-bootstrap-token-with-32-characters',
 };
 Object.assign(process.env, env);
 const { AppModule } = await import('../src/app.module.js');

@@ -1,6 +1,7 @@
 import { Injectable, OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Pool } from 'pg';
+import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import type { Environment } from '../config/environment.js';
 
 @Injectable()
@@ -14,11 +15,31 @@ export class DatabaseService implements OnApplicationShutdown {
       statement_timeout: config.get('DB_TIMEOUT_MS', { infer: true }),
       query_timeout: config.get('DB_TIMEOUT_MS', { infer: true }),
       options: '-c timezone=UTC',
-      application_name: 'zenovel-stage1',
+      application_name: 'zenovel-stage2',
     });
     this.pool.on('error', () => {
       /* probe reports failure; never log connection details */
     });
+  }
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values: unknown[] = [],
+  ): Promise<QueryResult<T>> {
+    return this.pool.query<T>(text, values);
+  }
+  async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await work(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
   async probe(): Promise<{ database: 'up' | 'down'; schema: 'up' | 'down' }> {
     try {

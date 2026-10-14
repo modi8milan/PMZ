@@ -1,6 +1,6 @@
-# ZENOVEL — Stage 1 technical foundation
+# ZENOVEL — Stage 2 authentication and access control
 
-Local development only. Next.js frontend, NestJS API, PostgreSQL, TypeScript and npm workspaces. No Stage 2 or later business modules are implemented. Owner acceptance is pending.
+Local development only. The accepted Stage 1 foundation now includes Stage 2 identity, session, MFA and access-control functionality. Stage 3 and later business modules are not implemented. Owner acceptance is pending.
 
 The authoritative specification is [Master Architecture v1.1](Data/ZENOVEL_Master_Architecture_v1.1.md); its Word companion remains intact. The actual folder is `Data` (capital D). The architecture's “use Section 23 for stages” reference is stale: the stage plan is in Section 25.
 
@@ -42,13 +42,13 @@ npm.cmd run db:validate
 npm.cmd run verify:architecture
 ```
 
-Read [Stage 1 evidence and acceptance report](docs/stage-1-report.md), [environment variables](docs/environment.md), [database workflow](docs/database.md), [technical decisions](docs/decisions.md), [API/security foundation](docs/security-api.md) and [design sources](docs/design-system.md). Installed dependency versions are captured in `package-lock.json`.
+Read [Stage 2 report](docs/stage-2-report.md), [authentication security record](docs/security-auth.md), [Stage 1 report](docs/stage-1-report.md), [environment variables](docs/environment.md), [database workflow](docs/database.md), [technical decisions](docs/decisions.md), [API/security foundation](docs/security-api.md) and [design sources](docs/design-system.md). Installed dependency versions are captured in `package-lock.json`.
 
 ## Structure
 
 ```text
-apps/api/              NestJS configuration, common controls, database and health modules; tests
-apps/web/              Next.js App Router, reusable UI components, design tokens, official logo
+apps/api/              NestJS authentication, administration, authorization, database and health modules; tests
+apps/web/              Next.js secure-access workspace, reusable UI components, design tokens, official logo
 packages/contracts/    Shared compile-time health/readiness/error contracts
 packages/database/     Explicit PostgreSQL migration and verification tooling
 scripts/               Portable runtime activation, safe local DB bootstrap, architecture integrity

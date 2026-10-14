@@ -49,8 +49,9 @@ export function setup(app: NestExpressApplication, logger: SafeLogger) {
   const origins = config.getOrThrow<string[]>('CORS_ORIGINS');
   app.enableCors({
     origin: origins,
-    methods: ['GET', 'OPTIONS'],
-    credentials: false,
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'X-Bootstrap-Token'],
+    credentials: true,
   });
   app.setGlobalPrefix('api/v1');
   app.useGlobalPipes(

@@ -2,7 +2,9 @@ import { Controller, Get, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import type { HealthResponse, ReadinessResponse } from '@zenovel/contracts';
 import { DatabaseService } from '../database/database.service.js';
+import { Public } from '../auth/auth.decorators.js';
 
+@Public()
 @Controller()
 export class HealthController {
   constructor(private readonly database: DatabaseService) {}

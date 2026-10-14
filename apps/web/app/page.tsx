@@ -1,8 +1,9 @@
 import Image from 'next/image';
 import { StatusPanel } from '../components/status-panel';
 import { Badge, Card, EmptyState, Field } from '../components/ui';
+import { AuthPortal } from '../components/auth-portal';
 
-export default function Home() {
+function StageOneHome() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main">
@@ -144,4 +145,9 @@ export default function Home() {
       </div>
     </div>
   );
+}
+
+void StageOneHome;
+export default function Home() {
+  return <AuthPortal />;
 }

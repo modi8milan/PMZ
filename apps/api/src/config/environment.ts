@@ -41,6 +41,25 @@ const schema = z.object({
   DB_TIMEOUT_MS: z.coerce.number().int().min(500).max(10000).default(3000),
   RATE_LIMIT: z.coerce.number().int().min(1).max(1000).default(60),
   RATE_TTL_MS: z.coerce.number().int().min(1000).max(3600000).default(60000),
+  PASSWORD_EXPIRY_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+  PASSWORD_HISTORY_COUNT: z.coerce.number().int().min(1).max(20).default(5),
+  SESSION_IDLE_MINUTES: z.coerce.number().int().min(5).max(1440).default(30),
+  SESSION_ABSOLUTE_HOURS: z.coerce.number().int().min(1).max(168).default(8),
+  LOGIN_MAX_FAILURES: z.coerce.number().int().min(3).max(20).default(5),
+  LOCKOUT_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
+  RESET_TOKEN_MINUTES: z.coerce.number().int().min(5).max(1440).default(30),
+  SESSION_COOKIE_NAME: z
+    .string()
+    .regex(/^__Host-[A-Za-z0-9_-]+$|^[A-Za-z0-9_-]+$/)
+    .default('zenovel_session'),
+  MFA_ENCRYPTION_KEY: z.string().refine((value) => {
+    try {
+      return Buffer.from(value, 'base64').length === 32;
+    } catch {
+      return false;
+    }
+  }),
+  BOOTSTRAP_TOKEN: z.string().min(32),
 });
 export type Environment = z.infer<typeof schema>;
 export function validateEnvironment(

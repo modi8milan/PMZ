@@ -68,16 +68,34 @@ try {
     const tables = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'zenovel'",
     );
+    const expectedMigrations = [
+      '1780000000000-initialize-schema',
+      '1790000000000-auth-access-control',
+    ];
+    const expectedTables = [
+      'departments',
+      'mfa_recovery_codes',
+      'password_history',
+      'password_reset_tokens',
+      'permissions',
+      'role_permissions',
+      'roles',
+      'security_events',
+      'sessions',
+      'user_roles',
+      'users',
+    ];
     if (
       !schema.rows[0]?.present ||
-      migration.rows.length !== 1 ||
-      migration.rows[0]?.name !== '1780000000000-initialize-schema' ||
-      tables.rows.length !== 0
+      migration.rows.map((row) => row.name).join('|') !==
+        expectedMigrations.join('|') ||
+      tables.rows
+        .map((row) => row.tablename)
+        .sort()
+        .join('|') !== expectedTables.join('|')
     )
-      throw new Error('Unexpected foundation schema');
-    console.log(
-      'Foundation schema and migration history PASS; zero business tables.',
-    );
+      throw new Error('Unexpected Stage 2 schema');
+    console.log('Stage 2 authentication schema and migration history PASS.');
   }
 } catch {
   console.error(

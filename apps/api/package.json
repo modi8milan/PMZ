@@ -9,7 +9,7 @@
     "start": "node dist/main.js",
     "lint": "eslint src test",
     "typecheck": "tsc --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/foundation.spec.js"
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/foundation.spec.js .test-dist/test/security.spec.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.3",

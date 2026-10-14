@@ -23,6 +23,9 @@ export class ErrorFilter implements ExceptionFilter {
 export function sendError(response: Response, statusCode: number) {
   const codes: Record<number, [string, string]> = {
     400: ['INVALID_REQUEST', 'Request validation failed.'],
+    401: ['AUTHENTICATION_REQUIRED', 'Authentication is required.'],
+    403: ['ACCESS_DENIED', 'Access is denied.'],
+    409: ['CONFLICT', 'The request conflicts with current state.'],
     404: ['NOT_FOUND', 'Resource not found.'],
     413: ['PAYLOAD_TOO_LARGE', 'Request payload is too large.'],
     429: ['RATE_LIMITED', 'Too many requests. Try again shortly.'],

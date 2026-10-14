@@ -1,8 +1,8 @@
 import type { Metadata } from 'next';
 import './globals.css';
 export const metadata: Metadata = {
-  title: 'ZENOVEL | Technical Foundation',
-  description: 'Local Stage 1 foundation for ZENOVEL Pharma Services.',
+  title: 'ZENOVEL | Secure Access',
+  description: 'Authentication and access control for ZENOVEL Pharma Services.',
 };
 export default function RootLayout({
   children,

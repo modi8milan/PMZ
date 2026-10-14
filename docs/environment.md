@@ -13,8 +13,18 @@ API file: `apps/api/.env` (ignored). Frontend file: `apps/web/.env.local` (ignor
 | DB_TIMEOUT_MS            | API                  | 500–10000 ms; default 3000; connect, query and statement bounds                                                                         |
 | RATE_LIMIT               | API                  | 1–1000 requests per window per client IP; default 60                                                                                    |
 | RATE_TTL_MS              | API                  | 1000–3600000 ms; default 60000                                                                                                          |
+| PASSWORD_EXPIRY_DAYS     | API                  | Configurable password lifetime; initial approved value 30                                                                               |
+| PASSWORD_HISTORY_COUNT   | API                  | Recent password hashes checked for reuse; initial value 5                                                                               |
+| SESSION_IDLE_MINUTES     | API                  | Sliding idle timeout; default 30                                                                                                        |
+| SESSION_ABSOLUTE_HOURS   | API                  | Non-extendable session lifetime; default 8                                                                                              |
+| LOGIN_MAX_FAILURES       | API                  | Failed attempts before temporary lockout; default 5                                                                                     |
+| LOCKOUT_MINUTES          | API                  | Temporary login lockout; default 15 minutes                                                                                             |
+| RESET_TOKEN_MINUTES      | API                  | Single-use reset-token lifetime; default 30 minutes                                                                                     |
+| SESSION_COOKIE_NAME      | API                  | HttpOnly session cookie name; default `zenovel_session`                                                                                 |
+| MFA_ENCRYPTION_KEY       | API                  | Required locally generated 32-byte Base64 key for AES-256-GCM; never expose to browser or Git                                           |
+| BOOTSTRAP_TOKEN          | API                  | Required random 32+ character secret for the one-time zero-user administrator bootstrap                                                 |
 | NEXT_PUBLIC_API_BASE_URL | Browser              | Local HTTP API address ending exactly /api/v1; default http://127.0.0.1:4000/api/v1; no credentials/query/fragment                      |
 
 Only the public API address reaches the browser. Database URL and credentials remain in the backend. The API validates configuration before binding. Invalid-value errors identify field names only. The frontend validates its URL before network calls and shows an unavailable state for invalid configuration.
 
-Timestamps in API responses/logs use ISO 8601 UTC. PostgreSQL pool sessions and the application role default to UTC. Future business timestamp columns must use `timestamptz`; none are introduced in Stage 1. The health screen displays check times in Asia/Kolkata (IST).
+Timestamps in API responses/logs use ISO 8601 UTC. PostgreSQL pool sessions and the application role default to UTC. Stage 2 security timestamps use `timestamptz`.
