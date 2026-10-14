@@ -18,3 +18,21 @@ The frontend has frame, MIME, referrer and permissions headers. A production non
 Not implemented: authentication/session management, 30-day password policy, reset/MFA, RBAC/object-scope authorization, electronic signatures, business audit trail, controlled business versions, confidential file processing/scanning, encryption/backup operational controls, regulatory validation or production deployment. Those remain mandatory future-stage requirements. No confidential study data is entered in this foundation.
 
 Dependency audit and actual checks are recorded in the Stage 1 report. A passing build is not a security assessment or regulatory compliance certificate.
+
+## Approved dependency risk disposition
+
+**Finding:** GHSA-vfj7-8cjw-p6xm / CVE-2026-93687 affects `braces@3.0.3` in the development/lint dependency chain.
+
+**Decision:** Temporarily accepted. No dependency changes are authorized by this disposition.
+
+**Rationale:** No suitable compatible upstream patch is currently available. The automatic remediation proposed by npm would downgrade the Next.js lint configuration and introduce framework, ESLint and rule-compatibility risks.
+
+**Interim controls:** Use trusted repository and lint-configuration inputs. Do not pass untrusted patterns or configurations into development tooling.
+
+**Review trigger:** Reassess this disposition when a compatible patched dependency or suitable Next.js update becomes available.
+
+**Required follow-up:** After any future approved remediation, verify the resolved dependency tree, full and production-only security audits, application builds and automated tests.
+
+**Approval status:** Risk disposition approved by the project owner on 14 October 2026.
+
+This disposition does not mean the vulnerability is fixed and does not constitute security certification, regulatory validation or production approval.
