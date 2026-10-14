@@ -35,5 +35,6 @@ export type SecurityEvent = {
   eventType: string;
   outcome: 'success' | 'failure' | 'denied';
   requestId?: string | null;
+  reason?: string | null;
   context?: Record<string, string | number | boolean | null>;
 };

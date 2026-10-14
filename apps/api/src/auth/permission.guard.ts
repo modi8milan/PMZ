@@ -6,7 +6,11 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { AuthorizationService } from './authorization.service.js';
-import { REPORT_DOWNLOAD, REQUIRED_PERMISSIONS } from './auth.decorators.js';
+import {
+  REPORT_DOWNLOAD,
+  REQUIRED_PERMISSIONS,
+  REQUIRED_ROLES,
+} from './auth.decorators.js';
 import type { AuthenticatedRequest } from './auth.types.js';
 
 @Injectable()
@@ -27,8 +31,15 @@ export class PermissionGuard implements CanActivate {
       REPORT_DOWNLOAD,
       [context.getHandler(), context.getClass()],
     );
+    const roles =
+      this.reflector.getAllAndOverride<string[]>(REQUIRED_ROLES, [
+        context.getHandler(),
+        context.getClass(),
+      ]) ?? [];
     if (
       !this.authorization.hasPermissions(request.auth.user, permissions) ||
+      (roles.length > 0 &&
+        !roles.some((role) => request.auth!.user.roles.includes(role))) ||
       (reportDownload &&
         !this.authorization.canDownloadMonitoringReport(request.auth.user))
     ) {

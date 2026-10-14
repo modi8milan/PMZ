@@ -32,11 +32,13 @@ type Catalog = {
     id: string;
     code: string;
     name: string;
+    description?: string | null;
     active: boolean;
     mfaRequired: boolean;
+    systemRole: boolean;
     permissions: string[];
   }>;
-  permissions: Array<{ code: string }>;
+  permissions: Array<{ code: string; description: string }>;
 };
 type UserRow = {
   id: string;
@@ -51,12 +53,22 @@ type UserRow = {
 type EventRow = {
   id: string;
   eventType: string;
-  outcome: string;
   actorUserId: string | null;
-  subjectUserId: string | null;
+  actorName: string | null;
+  reason: string | null;
   createdAt: string;
 };
+type AuditUser = { id: string; fullName: string };
 const api = apiBaseUrl();
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
 
 async function call<T>(
   path: string,
@@ -74,10 +86,11 @@ async function call<T>(
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok)
-    throw new Error(
+    throw new ApiError(
       typeof body.message === 'string'
         ? body.message
         : 'The request could not be completed.',
+      response.status,
     );
   return body as T;
 }
@@ -108,6 +121,20 @@ export function AuthPortal() {
       setError(e instanceof Error ? e.message : 'Request failed.');
     }
   };
+  const sessionAct = async (work: () => Promise<void>) => {
+    setError('');
+    setNotice('');
+    try {
+      await work();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setSession(null);
+        setError('Your session has expired. Please sign in again to continue.');
+        return;
+      }
+      setError(e instanceof Error ? e.message : 'Request failed.');
+    }
+  };
   if (loading)
     return (
       <div className="route-state">
@@ -124,8 +151,11 @@ export function AuthPortal() {
       <Gate title="Password change required">
         <PasswordPanel
           session={session}
-          act={act}
-          done={() => setSession(null)}
+          act={sessionAct}
+          done={() => {
+            setNotice('Password changed successfully. Please sign in again.');
+            setSession(null);
+          }}
         />
         {error && <Feedback error>{error}</Feedback>}
       </Gate>
@@ -133,12 +163,19 @@ export function AuthPortal() {
   if (session.mfaEnrollmentRequired)
     return (
       <Gate title="Authenticator enrollment required">
-        <MfaPanel session={session} act={act} done={() => setSession(null)} />
+        <MfaPanel
+          session={session}
+          act={sessionAct}
+          done={() => setSession(null)}
+        />
         {error && <Feedback error>{error}</Feedback>}
       </Gate>
     );
   const admin = session.user.permissions.includes('Administer');
   const audit = session.user.permissions.includes('AuditReview');
+  const roleManager = session.user.roles.some((role) =>
+    ['QMS', 'SYSTEM_ADMINISTRATOR'].includes(role),
+  );
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main">
@@ -156,14 +193,14 @@ export function AuthPortal() {
               Users
             </Nav>
           )}
-          {admin && (
+          {roleManager && (
             <Nav active={view === 'access'} onClick={() => setView('access')}>
-              Roles & departments
+              Roles & permissions
             </Nav>
           )}
           {audit && (
             <Nav active={view === 'events'} onClick={() => setView('events')}>
-              Security events
+              Audit Trail
             </Nav>
           )}
         </nav>
@@ -206,8 +243,8 @@ export function AuthPortal() {
                 : view === 'users'
                   ? 'User administration'
                   : view === 'access'
-                    ? 'Roles and departments'
-                    : 'Security events'}
+                    ? 'Roles and permissions'
+                    : 'Audit Trail'}
             </h1>
             <p className="intro-copy">
               Backend-authoritative authentication, session and permission
@@ -219,15 +256,20 @@ export function AuthPortal() {
           {view === 'account' && (
             <Account
               session={session}
-              act={act}
-              done={() => setSession(null)}
+              act={sessionAct}
+              done={() => {
+                setNotice(
+                  'Password changed successfully. Please sign in again.',
+                );
+                setSession(null);
+              }}
             />
           )}{' '}
           {view === 'users' && admin && (
-            <Users session={session} act={act} notify={setNotice} />
+            <Users session={session} act={sessionAct} notify={setNotice} />
           )}{' '}
-          {view === 'access' && admin && (
-            <Access session={session} act={act} notify={setNotice} />
+          {view === 'access' && roleManager && (
+            <Access session={session} act={sessionAct} notify={setNotice} />
           )}{' '}
           {view === 'events' && audit && <Events session={session} />}
           <footer className="page-footer">
@@ -311,7 +353,8 @@ function SignIn({
   const [mode, setMode] = useState<'login' | 'recovery' | 'reset'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [mfaCode, setMfa] = useState('');
+  const [authenticatorCode, setAuthenticatorCode] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
   const [token, setToken] = useState('');
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -323,7 +366,8 @@ function SignIn({
             body: JSON.stringify({
               username,
               password,
-              mfaCode: mfaCode || undefined,
+              authenticatorCode: authenticatorCode || undefined,
+              recoveryCode: recoveryCode || undefined,
             }),
           }),
         );
@@ -393,13 +437,23 @@ function SignIn({
             />
           )}
           {mode === 'login' && (
-            <Field
-              id="mfa-code"
-              label="Authenticator or recovery code"
-              value={mfaCode}
-              onChange={(e) => setMfa(e.target.value)}
-              hint="Required after MFA enrollment."
-            />
+            <>
+              <Field
+                id="authenticator-code"
+                label="Authenticator code"
+                value={authenticatorCode}
+                onChange={(e) => setAuthenticatorCode(e.target.value)}
+                pattern="[0-9]{6}"
+                hint="Enter the current six-digit code from your authenticator app."
+              />
+              <Field
+                id="login-recovery-code"
+                label="One-time recovery code"
+                value={recoveryCode}
+                onChange={(e) => setRecoveryCode(e.target.value)}
+                hint="Use this only when your authenticator app is unavailable."
+              />
+            </>
           )}
           {mode === 'recovery' && (
             <p className="muted">
@@ -445,16 +499,26 @@ function PasswordPanel({
 }) {
   const [currentPassword, setCurrent] = useState('');
   const [newPassword, setNext] = useState('');
+  const [confirmPassword, setConfirm] = useState('');
+  const [authenticatorCode, setAuthenticatorCode] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
         void act(async () => {
+          if (newPassword !== confirmPassword)
+            throw new Error('New password and confirmation do not match.');
           await call(
             '/auth/password',
             {
               method: 'POST',
-              body: JSON.stringify({ currentPassword, newPassword }),
+              body: JSON.stringify({
+                currentPassword,
+                newPassword,
+                authenticatorCode: authenticatorCode || undefined,
+                recoveryCode: recoveryCode || undefined,
+              }),
             },
             session.csrfToken,
           );
@@ -480,6 +544,43 @@ function PasswordPanel({
         required
         hint="12+ characters with letters and numbers; the previous five cannot be reused."
       />
+      <Field
+        id="confirm-new-password"
+        label="Confirm new password"
+        type="password"
+        value={confirmPassword}
+        onChange={(e) => setConfirm(e.target.value)}
+        minLength={12}
+        required
+      />
+      {session.user.mfaEnabled && (
+        <>
+          <p className="muted">
+            Additional verification is required. Enter one of the following.
+          </p>
+          <Field
+            id="password-authenticator-code"
+            label="Authenticator code"
+            value={authenticatorCode}
+            onChange={(e) => setAuthenticatorCode(e.target.value)}
+            pattern="[0-9]{6}"
+            hint="Enter the current six-digit code from your authenticator app."
+          />
+          <Field
+            id="password-recovery-code"
+            label="One-time recovery code"
+            value={recoveryCode}
+            onChange={(e) => setRecoveryCode(e.target.value)}
+            hint="Use a recovery code only when your authenticator app is unavailable."
+          />
+        </>
+      )}
+      {session.user.mfaRequired && !session.user.mfaEnabled && (
+        <Feedback>
+          After changing your password and signing in again, ZENOVEL will guide
+          you through required authenticator enrollment.
+        </Feedback>
+      )}
       <Button type="submit">Change password</Button>
     </form>
   );
@@ -644,7 +745,9 @@ function MfaDisablePanel({
   done: () => void;
 }) {
   const [password, setPassword] = useState('');
-  const [code, setCode] = useState('');
+  const [authenticatorCode, setAuthenticatorCode] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
+  const [reason, setReason] = useState('');
   if (session.user.mfaRequired)
     return (
       <Feedback>
@@ -659,7 +762,15 @@ function MfaDisablePanel({
         void act(async () => {
           await call(
             '/auth/mfa/disable',
-            { method: 'POST', body: JSON.stringify({ password, code }) },
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                password,
+                authenticatorCode: authenticatorCode || undefined,
+                recoveryCode: recoveryCode || undefined,
+                reason,
+              }),
+            },
             session.csrfToken,
           );
           done();
@@ -675,10 +786,25 @@ function MfaDisablePanel({
         required
       />
       <Field
-        id="disable-mfa-code"
-        label="Authenticator or recovery code"
-        value={code}
-        onChange={(event) => setCode(event.target.value)}
+        id="disable-mfa-authenticator-code"
+        label="Authenticator code"
+        value={authenticatorCode}
+        onChange={(event) => setAuthenticatorCode(event.target.value)}
+        pattern="[0-9]{6}"
+        hint="Enter the current six-digit code from your authenticator app."
+      />
+      <Field
+        id="disable-mfa-recovery-code"
+        label="One-time recovery code"
+        value={recoveryCode}
+        onChange={(event) => setRecoveryCode(event.target.value)}
+        hint="Use this only if the authenticator app is unavailable."
+      />
+      <Field
+        id="disable-mfa-reason"
+        label="Reason for disabling MFA"
+        value={reason}
+        onChange={(event) => setReason(event.target.value)}
         required
       />
       <Button type="submit">Disable MFA</Button>
@@ -697,35 +823,54 @@ function Users({
 }) {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [usersError, setUsersError] = useState('');
+  const [catalogError, setCatalogError] = useState('');
   const [username, setUsername] = useState('');
   const [fullName, setFullName] = useState('');
   const [roleId, setRole] = useState('');
   const [departmentId, setDepartment] = useState('');
+  const [createReason, setCreateReason] = useState('');
   const [token, setToken] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
-  const load = useCallback(async () => {
-    const [u, c] = await Promise.all([
-      call<UserRow[]>('/admin/users'),
-      call<Catalog>('/admin/catalog'),
-    ]);
-    setUsers(u);
-    setCatalog(c);
+  const [adminAuthenticatorCode, setAdminAuthenticatorCode] = useState('');
+  const [adminRecoveryCode, setAdminRecoveryCode] = useState('');
+  const [adminReason, setAdminReason] = useState('');
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editingRoleIds, setEditingRoleIds] = useState<string[]>([]);
+  const [roleReason, setRoleReason] = useState('');
+  const loadUsers = useCallback(async () => {
+    setUsersLoading(true);
+    setUsersError('');
+    try {
+      setUsers(await call<UserRow[]>('/admin/users'));
+    } catch (error) {
+      setUsersError(
+        error instanceof Error
+          ? error.message
+          : 'The user list could not be loaded.',
+      );
+    } finally {
+      setUsersLoading(false);
+    }
+  }, []);
+  const loadCatalog = useCallback(async () => {
+    setCatalogError('');
+    try {
+      setCatalog(await call<Catalog>('/admin/catalog'));
+    } catch (error) {
+      setCatalog(null);
+      setCatalogError(
+        error instanceof Error
+          ? error.message
+          : 'Roles and departments could not be loaded.',
+      );
+    }
   }, []);
   useEffect(() => {
-    let active = true;
-    void Promise.all([
-      call<UserRow[]>('/admin/users'),
-      call<Catalog>('/admin/catalog'),
-    ]).then(([loadedUsers, loadedCatalog]) => {
-      if (active) {
-        setUsers(loadedUsers);
-        setCatalog(loadedCatalog);
-      }
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+    void loadUsers();
+    void loadCatalog();
+  }, [loadCatalog, loadUsers]);
   const action = (path: string, method = 'POST', body?: object) =>
     act(async () => {
       const result = await call<{ resetToken?: string }>(
@@ -735,13 +880,53 @@ function Users({
       );
       if (result.resetToken) setToken(result.resetToken);
       notify('Administrative action completed and recorded.');
-      await load();
+      await Promise.all([loadUsers(), loadCatalog()]);
+    });
+  const reasonedAction = (
+    label: string,
+    path: string,
+    method = 'POST',
+    body: object = {},
+  ) => {
+    const reason = window.prompt(`Reason for ${label}:`);
+    if (!reason?.trim()) return;
+    void action(path, method, { ...body, reason: reason.trim() });
+  };
+  const beginRoleEdit = (user: UserRow) => {
+    setEditingUserId(user.id);
+    setEditingRoleIds(
+      catalog?.roles
+        .filter((role) => role.active && user.roles.includes(role.code))
+        .map((role) => role.id) ?? [],
+    );
+    setRoleReason('');
+  };
+  const saveRoles = (user: UserRow) =>
+    act(async () => {
+      await call(
+        `/admin/users/${user.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ roleIds: editingRoleIds, reason: roleReason }),
+        },
+        session.csrfToken,
+      );
+      await Promise.all([loadUsers(), loadCatalog()]);
+      setEditingUserId(null);
+      setEditingRoleIds([]);
+      setRoleReason('');
+      notify(`Roles updated for ${user.fullName}. Existing sessions revoked.`);
     });
   return (
     <>
       <Card>
         <p className="eyebrow">CONTROLLED PROVISIONING</p>
         <h2>Create individual account</h2>
+        {catalogError && (
+          <Feedback error>
+            Roles and departments could not be loaded: {catalogError}
+          </Feedback>
+        )}
         <form
           className="form-grid"
           onSubmit={(e) => {
@@ -751,6 +936,7 @@ function Users({
               fullName,
               roleIds: [roleId],
               departmentId: departmentId || undefined,
+              reason: createReason,
             });
           }}
         >
@@ -801,7 +987,16 @@ function Users({
                 ))}
             </select>
           </label>
-          <Button type="submit">Create account</Button>
+          <Button type="submit" disabled={!catalog}>
+            Create account
+          </Button>
+          <Field
+            id="create-user-reason"
+            label="Reason for account creation"
+            value={createReason}
+            onChange={(e) => setCreateReason(e.target.value)}
+            required
+          />
         </form>
         {token && (
           <Feedback>
@@ -821,65 +1016,184 @@ function Users({
           autoComplete="current-password"
           hint="Required only when resetting another user's MFA enrollment."
         />
-        <Table
-          caption="ZENOVEL user accounts"
-          headings={['User', 'Department', 'Roles', 'Status', 'Controls']}
-        >
-          {users.map((u) => (
-            <tr key={u.id}>
-              <th scope="row">
-                {u.fullName}
-                <small>{u.username}</small>
-              </th>
-              <td>{u.department ?? 'Unassigned'}</td>
-              <td>{u.roles.join(', ')}</td>
-              <td>
-                <Badge tone={u.status === 'active' ? 'success' : 'error'}>
-                  {u.status}
-                </Badge>
-              </td>
-              <td className="table-actions">
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() =>
-                    void action(`/admin/users/${u.id}`, 'PATCH', {
-                      status: u.status === 'active' ? 'inactive' : 'active',
-                    })
-                  }
-                >
-                  {u.status === 'active' ? 'Deactivate' : 'Activate'}
-                </Button>
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() => void action(`/admin/users/${u.id}/reset`)}
-                >
-                  Reset
-                </Button>
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() =>
-                    void action(`/admin/users/${u.id}/revoke-sessions`)
-                  }
-                >
-                  Revoke
-                </Button>
-                {u.mfaEnabled && (
+        <Field
+          id="admin-authenticator-code"
+          label="Administrator authenticator code"
+          value={adminAuthenticatorCode}
+          onChange={(e) => setAdminAuthenticatorCode(e.target.value)}
+          pattern="[0-9]{6}"
+          hint="Enter the current six-digit code for sensitive MFA resets."
+        />
+        <Field
+          id="admin-recovery-code"
+          label="Administrator one-time recovery code"
+          value={adminRecoveryCode}
+          onChange={(e) => setAdminRecoveryCode(e.target.value)}
+        />
+        <Field
+          id="admin-sensitive-reason"
+          label="Reason for MFA reset"
+          value={adminReason}
+          onChange={(e) => setAdminReason(e.target.value)}
+        />
+        {usersLoading ? (
+          <Feedback>Loading existing user accounts…</Feedback>
+        ) : usersError ? (
+          <Feedback error>
+            User accounts could not be loaded: {usersError}
+          </Feedback>
+        ) : users.length === 0 ? (
+          <Feedback>No user accounts were found.</Feedback>
+        ) : (
+          <Table
+            caption="ZENOVEL user accounts"
+            headings={['User', 'Department', 'Roles', 'Status', 'Controls']}
+          >
+            {users.map((u) => (
+              <tr key={u.id}>
+                <th scope="row">
+                  {u.fullName}
+                  <small>{u.username}</small>
+                </th>
+                <td>{u.department ?? 'Unassigned'}</td>
+                <td>
+                  {editingUserId === u.id ? (
+                    <fieldset className="role-editor">
+                      <legend>Roles for {u.fullName}</legend>
+                      <small>
+                        Currently assigned: {u.roles.join(', ') || 'None'}
+                      </small>
+                      <Field
+                        id={`role-reason-${u.id}`}
+                        label="Reason for role change"
+                        value={roleReason}
+                        onChange={(event) => setRoleReason(event.target.value)}
+                        required
+                      />
+                      <div className="permission-grid">
+                        {catalog?.roles
+                          .filter((role) => role.active)
+                          .map((role) => (
+                            <label key={role.id}>
+                              <input
+                                type="checkbox"
+                                checked={editingRoleIds.includes(role.id)}
+                                onChange={(event) =>
+                                  setEditingRoleIds((current) =>
+                                    event.target.checked
+                                      ? [...current, role.id]
+                                      : current.filter((id) => id !== role.id),
+                                  )
+                                }
+                              />
+                              {role.name}
+                            </label>
+                          ))}
+                      </div>
+                      <small>
+                        Select one or more active roles. Saving replaces the
+                        current assignment.
+                      </small>
+                      <div className="inline-controls">
+                        <Button
+                          className="button-small"
+                          onClick={() => void saveRoles(u)}
+                          disabled={
+                            editingRoleIds.length === 0 || !roleReason.trim()
+                          }
+                        >
+                          Save
+                        </Button>
+                        <Button
+                          className="button-small button-secondary"
+                          onClick={() => {
+                            setEditingUserId(null);
+                            setEditingRoleIds([]);
+                            setRoleReason('');
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </fieldset>
+                  ) : (
+                    u.roles.join(', ') || 'None'
+                  )}
+                </td>
+                <td>
+                  <Badge tone={u.status === 'active' ? 'success' : 'error'}>
+                    {u.status}
+                  </Badge>
+                </td>
+                <td className="table-actions">
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() => beginRoleEdit(u)}
+                    disabled={!catalog}
+                  >
+                    Edit roles
+                  </Button>
                   <Button
                     className="button-small button-secondary"
                     onClick={() =>
-                      void action(`/admin/users/${u.id}/mfa-reset`, 'POST', {
-                        currentPassword: adminPassword,
-                      })
+                      reasonedAction(
+                        u.status === 'active'
+                          ? 'account deactivation'
+                          : 'account activation',
+                        `/admin/users/${u.id}`,
+                        'PATCH',
+                        {
+                          status: u.status === 'active' ? 'inactive' : 'active',
+                        },
+                      )
                     }
-                    disabled={!adminPassword}
                   >
-                    Reset MFA
+                    {u.status === 'active' ? 'Deactivate' : 'Activate'}
                   </Button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </Table>
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() =>
+                      reasonedAction(
+                        'administrator password reset',
+                        `/admin/users/${u.id}/reset`,
+                      )
+                    }
+                  >
+                    Reset
+                  </Button>
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() =>
+                      reasonedAction(
+                        'session revocation',
+                        `/admin/users/${u.id}/revoke-sessions`,
+                      )
+                    }
+                  >
+                    Revoke
+                  </Button>
+                  {u.mfaEnabled && (
+                    <Button
+                      className="button-small button-secondary"
+                      onClick={() =>
+                        void action(`/admin/users/${u.id}/mfa-reset`, 'POST', {
+                          currentPassword: adminPassword,
+                          authenticatorCode:
+                            adminAuthenticatorCode || undefined,
+                          recoveryCode: adminRecoveryCode || undefined,
+                          reason: adminReason,
+                        })
+                      }
+                      disabled={!adminPassword || !adminReason.trim()}
+                    >
+                      Reset MFA
+                    </Button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </Table>
+        )}
       </Card>
     </>
   );
@@ -899,21 +1213,31 @@ function Access({
   const [dn, setDn] = useState('');
   const [rc, setRc] = useState('');
   const [rn, setRn] = useState('');
-  const [selectedRoleId, setSelectedRoleId] = useState('');
-  const [selectedPermissions, setSelectedPermissions] = useState<string[]>([]);
-  const load = useCallback(
-    () => call<Catalog>('/admin/catalog').then(setCatalog),
-    [],
+  const [roleDescription, setRoleDescription] = useState('');
+  const [roleReason, setRoleReason] = useState('');
+  const [rolePermissions, setRolePermissions] = useState<string[]>([]);
+  const [roleMfa, setRoleMfa] = useState(false);
+  const [editingRoleId, setEditingRoleId] = useState<string | 'new' | null>(
+    null,
   );
-  useEffect(() => {
-    let active = true;
-    void call<Catalog>('/admin/catalog').then((loadedCatalog) => {
-      if (active) setCatalog(loadedCatalog);
-    });
-    return () => {
-      active = false;
-    };
+  const [catalogError, setCatalogError] = useState('');
+  const administrator = session.user.permissions.includes('Administer');
+  const load = useCallback(async () => {
+    setCatalogError('');
+    try {
+      setCatalog(await call<Catalog>('/admin/catalog'));
+    } catch (error) {
+      setCatalog(null);
+      setCatalogError(
+        error instanceof Error
+          ? error.message
+          : 'The access-control catalog could not be loaded.',
+      );
+    }
   }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
   const create = (path: string, body: object) =>
     act(async () => {
       await call(
@@ -924,7 +1248,11 @@ function Access({
       notify('Configuration change recorded.');
       await load();
     });
-  const update = (path: string, method: 'PATCH' | 'PUT', body: object) =>
+  const update = (
+    path: string,
+    method: 'PATCH' | 'PUT' | 'DELETE',
+    body: object,
+  ) =>
     act(async () => {
       await call(
         path,
@@ -934,167 +1262,265 @@ function Access({
       notify('Configuration change recorded.');
       await load();
     });
+  const closeRoleForm = () => {
+    setEditingRoleId(null);
+    setRc('');
+    setRn('');
+    setRoleDescription('');
+    setRoleReason('');
+    setRolePermissions([]);
+    setRoleMfa(false);
+  };
+  const editRole = (role: Catalog['roles'][number]) => {
+    setEditingRoleId(role.id);
+    setRc(role.code);
+    setRn(role.name);
+    setRoleDescription(role.description ?? '');
+    setRolePermissions(role.permissions);
+    setRoleMfa(role.mfaRequired);
+    setRoleReason('');
+  };
+  const saveRole = () =>
+    act(async () => {
+      const details = {
+        name: rn,
+        description: roleDescription || undefined,
+        mfaRequired: roleMfa,
+        permissions: rolePermissions,
+        reason: roleReason,
+      };
+      const body = editingRoleId === 'new' ? { code: rc, ...details } : details;
+      await call(
+        editingRoleId === 'new'
+          ? '/admin/roles'
+          : `/admin/roles/${editingRoleId}`,
+        {
+          method: editingRoleId === 'new' ? 'POST' : 'PATCH',
+          body: JSON.stringify(body),
+        },
+        session.csrfToken,
+      );
+      notify(
+        editingRoleId === 'new'
+          ? 'Role created and recorded.'
+          : 'Role updated and recorded.',
+      );
+      closeRoleForm();
+      await load();
+    });
+  const retireRole = (role: Catalog['roles'][number]) => {
+    const reason = window.prompt(`Reason for retiring ${role.name}:`);
+    if (
+      !reason?.trim() ||
+      !window.confirm(`Retire ${role.name}? This does not erase audit history.`)
+    )
+      return;
+    void update(`/admin/roles/${role.id}`, 'DELETE', {
+      reason: reason.trim(),
+    });
+  };
+  if (catalogError)
+    return (
+      <Card>
+        <p className="eyebrow">ROLES, PERMISSIONS & DEPARTMENTS</p>
+        <h2>Administration data is unavailable</h2>
+        <Feedback error>
+          The access-control catalog could not be loaded: {catalogError}
+        </Feedback>
+        <Button className="button-secondary" onClick={() => void load()}>
+          Retry
+        </Button>
+      </Card>
+    );
   if (!catalog) return <Card>Loading access-control catalog…</Card>;
   return (
     <div className="content-grid">
-      <Card>
-        <p className="eyebrow">DEPARTMENTS</p>
-        <h2>Organizational membership</h2>
-        <ul className="control-list">
-          {catalog.departments.map((d) => (
-            <li key={d.id}>
-              <span>
-                <strong>{d.code}</strong> · {d.name}
-              </span>
-              <span className="inline-controls">
-                <Badge tone={d.active ? 'success' : 'neutral'}>
-                  {d.active ? 'Active' : 'Inactive'}
-                </Badge>
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() =>
-                    void update(`/admin/departments/${d.id}`, 'PATCH', {
-                      active: !d.active,
-                    })
-                  }
-                >
-                  {d.active ? 'Deactivate' : 'Activate'}
-                </Button>
-              </span>
-            </li>
-          ))}
-        </ul>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void create('/admin/departments', { code: dc, name: dn });
-          }}
-        >
-          <Field
-            id="department-code"
-            label="Code"
-            value={dc}
-            onChange={(e) => setDc(e.target.value.toUpperCase())}
-            required
-          />
-          <Field
-            id="department-name"
-            label="Name"
-            value={dn}
-            onChange={(e) => setDn(e.target.value)}
-            required
-          />
-          <Button>Add department</Button>
-        </form>
-      </Card>
-      <Card>
-        <p className="eyebrow">ROLES & PERMISSIONS</p>
-        <h2>Configured roles</h2>
-        <ul className="control-list">
-          {catalog.roles.map((r) => (
-            <li key={r.id}>
-              <span>
-                <strong>{r.name}</strong>
-                <small>{r.permissions.join(', ') || 'No permissions'}</small>
-              </span>
-              <span className="inline-controls">
-                {r.mfaRequired && <Badge tone="warning">MFA</Badge>}
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() =>
-                    void update(`/admin/roles/${r.id}`, 'PATCH', {
-                      mfaRequired: !r.mfaRequired,
-                    })
-                  }
-                >
-                  {r.mfaRequired ? 'Make MFA optional' : 'Require MFA'}
-                </Button>
-                <Button
-                  className="button-small button-secondary"
-                  onClick={() =>
-                    void update(`/admin/roles/${r.id}`, 'PATCH', {
-                      active: !r.active,
-                    })
-                  }
-                >
-                  {r.active ? 'Deactivate' : 'Activate'}
-                </Button>
-              </span>
-            </li>
-          ))}
-        </ul>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void create('/admin/roles', { code: rc, name: rn });
-          }}
-        >
-          <Field
-            id="role-code"
-            label="Code"
-            value={rc}
-            onChange={(e) => setRc(e.target.value.toUpperCase())}
-            required
-          />
-          <Field
-            id="role-name"
-            label="Name"
-            value={rn}
-            onChange={(e) => setRn(e.target.value)}
-            required
-          />
-          <Button>Add role</Button>
-        </form>
-        <hr className="control-divider" />
-        <h3>Permission mapping</h3>
-        <label className="select-field">
-          Role
-          <select
-            value={selectedRoleId}
-            onChange={(e) => {
-              const role = catalog.roles.find(
-                (item) => item.id === e.target.value,
-              );
-              setSelectedRoleId(e.target.value);
-              setSelectedPermissions(role?.permissions ?? []);
-            }}
-          >
-            <option value="">Select role</option>
-            {catalog.roles.map((role) => (
-              <option key={role.id} value={role.id}>
-                {role.name}
-              </option>
+      {administrator && (
+        <Card>
+          <p className="eyebrow">DEPARTMENTS</p>
+          <h2>Organizational membership</h2>
+          <ul className="control-list">
+            {catalog.departments.map((d) => (
+              <li key={d.id}>
+                <span>
+                  <strong>{d.code}</strong> · {d.name}
+                </span>
+                <span className="inline-controls">
+                  <Badge tone={d.active ? 'success' : 'neutral'}>
+                    {d.active ? 'Active' : 'Inactive'}
+                  </Badge>
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() =>
+                      void update(`/admin/departments/${d.id}`, 'PATCH', {
+                        active: !d.active,
+                      })
+                    }
+                  >
+                    {d.active ? 'Deactivate' : 'Activate'}
+                  </Button>
+                </span>
+              </li>
             ))}
-          </select>
-        </label>
-        {selectedRoleId && (
+          </ul>
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              void update(`/admin/roles/${selectedRoleId}/permissions`, 'PUT', {
-                permissions: selectedPermissions,
-              });
+              void create('/admin/departments', { code: dc, name: dn });
             }}
           >
-            <div className="permission-grid">
-              {catalog.permissions.map((permission) => (
-                <label key={permission.code}>
-                  <input
-                    type="checkbox"
-                    checked={selectedPermissions.includes(permission.code)}
-                    onChange={(e) =>
-                      setSelectedPermissions((current) =>
-                        e.target.checked
-                          ? [...current, permission.code]
-                          : current.filter((code) => code !== permission.code),
-                      )
-                    }
-                  />
-                  {permission.code}
-                </label>
-              ))}
+            <Field
+              id="department-code"
+              label="Code"
+              value={dc}
+              onChange={(e) => setDc(e.target.value.toUpperCase())}
+              required
+            />
+            <Field
+              id="department-name"
+              label="Name"
+              value={dn}
+              onChange={(e) => setDn(e.target.value)}
+              required
+            />
+            <Button>Add department</Button>
+          </form>
+        </Card>
+      )}
+      <Card>
+        <p className="eyebrow">ROLES & PERMISSIONS</p>
+        <h2>Configured roles</h2>
+        <Table
+          caption="Configured roles"
+          headings={['Role name', 'Status', 'Available role actions']}
+        >
+          {catalog.roles.map((role) => (
+            <tr key={role.id}>
+              <th scope="row">
+                {role.name}
+                <small>{role.code}</small>
+              </th>
+              <td>
+                <Badge tone={role.active ? 'success' : 'neutral'}>
+                  {role.active ? 'Active' : 'Retired'}
+                </Badge>
+              </td>
+              <td className="table-actions">
+                {role.code === 'SYSTEM_ADMINISTRATOR' ? (
+                  <Badge tone="warning">Protected</Badge>
+                ) : (
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() => editRole(role)}
+                  >
+                    Edit role
+                  </Button>
+                )}
+                {!role.systemRole && (
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() => retireRole(role)}
+                  >
+                    Delete role
+                  </Button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </Table>
+        {!editingRoleId && (
+          <Button
+            onClick={() => {
+              closeRoleForm();
+              setEditingRoleId('new');
+            }}
+          >
+            Create role
+          </Button>
+        )}
+        {editingRoleId && (
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveRole();
+            }}
+          >
+            <h3>{editingRoleId === 'new' ? 'Create role' : 'Edit role'}</h3>
+            <Field
+              id="role-code"
+              label="Role code"
+              value={rc}
+              onChange={(e) => setRc(e.target.value.toUpperCase())}
+              required
+              disabled={editingRoleId !== 'new'}
+            />
+            <Field
+              id="role-name"
+              label="Role name"
+              value={rn}
+              onChange={(e) => setRn(e.target.value)}
+              required
+            />
+            <Field
+              id="role-description"
+              label="Description"
+              value={roleDescription}
+              onChange={(e) => setRoleDescription(e.target.value)}
+            />
+            <label>
+              <input
+                type="checkbox"
+                checked={roleMfa}
+                onChange={(e) => setRoleMfa(e.target.checked)}
+              />{' '}
+              Require MFA
+            </label>
+            <fieldset className="access-rights-editor">
+              <legend>Access rights</legend>
+              <p className="muted">
+                Review the selected access rights before saving.
+              </p>
+              <div className="permission-grid">
+                {catalog.permissions.map((permission) => (
+                  <label key={permission.code}>
+                    <input
+                      type="checkbox"
+                      checked={rolePermissions.includes(permission.code)}
+                      onChange={(e) =>
+                        setRolePermissions((current) =>
+                          e.target.checked
+                            ? [...current, permission.code]
+                            : current.filter(
+                                (code) => code !== permission.code,
+                              ),
+                        )
+                      }
+                    />
+                    <span>
+                      <strong>{permission.code}</strong>
+                      <small>{permission.description}</small>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            <Field
+              id="role-change-reason"
+              label="Reason for change"
+              value={roleReason}
+              onChange={(e) => setRoleReason(e.target.value)}
+              required
+            />
+            <div className="inline-controls">
+              <Button type="submit">Save role</Button>
+              <Button
+                type="button"
+                className="button-secondary"
+                onClick={closeRoleForm}
+              >
+                Cancel
+              </Button>
             </div>
-            <Button>Save permission mapping</Button>
           </form>
         )}
       </Card>
@@ -1110,34 +1536,135 @@ function Access({
     </div>
   );
 }
+const changeLabels: Record<string, string> = {
+  user_roles_changed: 'User role changed.',
+  role_permissions_changed: 'Role access rights updated.',
+  role_changed: 'Role updated.',
+  role_created: 'Role created.',
+  role_retired: 'Role retired.',
+  user_deactivated: 'Account deactivated.',
+  user_activated: 'Account activated.',
+  mfa_reset: 'MFA reset by administrator.',
+  password_reset_issued: 'Password reset initiated by administrator.',
+  sessions_revoked: 'Sessions revoked.',
+};
 function Events({ session }: { session: Session }) {
   const [events, setEvents] = useState<EventRow[]>([]);
+  const [users, setUsers] = useState<AuditUser[]>([]);
   const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    call<EventRow[]>('/admin/security-events')
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [userFilter, setUserFilter] = useState('');
+  const [reason, setReason] = useState('');
+  const [activeFilters, setActiveFilters] = useState('');
+  const load = useCallback((query = '') => {
+    setFailed(false);
+    return call<EventRow[]>(`/admin/security-events${query}`)
       .then(setEvents)
       .catch(() => setFailed(true));
+  }, []);
+  useEffect(() => {
+    let active = true;
+    void Promise.all([
+      call<EventRow[]>('/admin/security-events'),
+      call<AuditUser[]>('/admin/audit-users'),
+    ])
+      .then(([loadedEvents, loadedUsers]) => {
+        if (active) {
+          setEvents(loadedEvents);
+          setUsers(loadedUsers);
+        }
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+    return () => {
+      active = false;
+    };
   }, [session]);
+  const apply = () => {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    if (userFilter) params.set('user', userFilter);
+    if (reason.trim()) params.set('reason', reason.trim());
+    const query = params.size ? `?${params}` : '';
+    setActiveFilters(query);
+    void load(query);
+  };
+  const clear = () => {
+    setFrom('');
+    setTo('');
+    setUserFilter('');
+    setReason('');
+    setActiveFilters('');
+    void load();
+  };
   return (
     <Card>
+      <div className="audit-filters">
+        <Field
+          id="audit-from"
+          label="From"
+          type="date"
+          value={from}
+          onChange={(e) => setFrom(e.target.value)}
+        />
+        <Field
+          id="audit-to"
+          label="To"
+          type="date"
+          value={to}
+          onChange={(e) => setTo(e.target.value)}
+        />
+        <label className="select-field">
+          User
+          <select
+            value={userFilter}
+            onChange={(e) => setUserFilter(e.target.value)}
+          >
+            <option value="">All users</option>
+            {users.map((user) => (
+              <option key={user.id} value={user.id}>
+                {user.fullName} · {user.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Field
+          id="audit-reason"
+          label="Reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+        />
+        <div className="inline-controls">
+          <Button onClick={apply}>Apply filters</Button>
+          <Button className="button-secondary" onClick={clear}>
+            Clear filters
+          </Button>
+        </div>
+      </div>
+      {activeFilters && <Feedback>Audit Trail filters are active.</Feedback>}
       {failed ? (
-        <Feedback error>Security events could not be loaded.</Feedback>
+        <Feedback error>Audit trail could not be loaded.</Feedback>
+      ) : events.length === 0 ? (
+        <Feedback>No audit events match the selected filters.</Feedback>
       ) : (
         <Table
-          caption="Recent security events"
-          headings={['Time', 'Event', 'Outcome', 'Actor', 'Subject']}
+          caption="Recent audit trail events"
+          headings={['Time Stamp', 'User', 'Change', 'Reason for Change']}
         >
           {events.map((e) => (
             <tr key={e.id}>
               <td>{displayDate(e.createdAt)}</td>
-              <th scope="row">{e.eventType}</th>
-              <td>
-                <Badge tone={e.outcome === 'success' ? 'success' : 'error'}>
-                  {e.outcome}
-                </Badge>
+              <td className="audit-user">
+                {e.actorName ?? 'System'}
+                <small>{e.actorUserId ?? 'System event'}</small>
               </td>
-              <td>{e.actorUserId ?? 'System'}</td>
-              <td>{e.subjectUserId ?? 'None'}</td>
+              <th scope="row">
+                {changeLabels[e.eventType] ?? e.eventType.replaceAll('_', ' ')}
+              </th>
+              <td>{e.reason ?? '—'}</td>
             </tr>
           ))}
         </Table>

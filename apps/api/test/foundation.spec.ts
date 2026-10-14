@@ -130,6 +130,15 @@ describe('API foundation (mocked database)', () => {
       .get('/api/v1/health')
       .set('Origin', 'https://untrusted.example');
     assert.equal(denied.headers['access-control-allow-origin'], undefined);
+    const roleRetirementPreflight = await request(app.getHttpServer())
+      .options('/api/v1/admin/roles/test-role')
+      .set('Origin', 'http://localhost:3000')
+      .set('Access-Control-Request-Method', 'DELETE')
+      .expect(204);
+    assert.match(
+      roleRetirementPreflight.headers['access-control-allow-methods'] ?? '',
+      /(?:^|,)DELETE(?:,|$)/,
+    );
   });
   it('limits repeated requests', async () => {
     for (let i = 0; i < 3; i++)

@@ -71,6 +71,7 @@ try {
     const expectedMigrations = [
       '1780000000000-initialize-schema',
       '1790000000000-auth-access-control',
+      '1800000000000-stage-2-audit-role-refinement',
     ];
     const expectedTables = [
       'departments',

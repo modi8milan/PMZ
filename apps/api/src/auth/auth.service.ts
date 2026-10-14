@@ -208,10 +208,13 @@ export class AuthService {
     user: AuthUser,
     current: string,
     next: string,
+    authenticatorCode?: string,
+    recoveryCode?: string,
     requestId?: string,
   ): Promise<void> {
     if (!(await verifyPassword(current, user.passwordHash)))
-      throw new UnauthorizedException();
+      throw new BadRequestException('Current password is incorrect.');
+    await this.verifyMfaStepUp(user, authenticatorCode, recoveryCode);
     await this.assertNewPassword(user, next);
     await this.repository.changePassword(
       user,
@@ -240,6 +243,7 @@ export class AuthService {
     actorId: string,
     userId: string,
     requestId?: string,
+    reason?: string,
   ): Promise<string> {
     const user = await this.repository.findUserById(userId);
     if (!user) throw new BadRequestException();
@@ -256,6 +260,7 @@ export class AuthService {
       eventType: 'password_reset_issued',
       outcome: 'success',
       requestId,
+      reason,
     });
     return token;
   }
@@ -290,7 +295,7 @@ export class AuthService {
     requestId?: string,
   ): Promise<{ secret: string; uri: string }> {
     if (!(await verifyPassword(password, user.passwordHash)))
-      throw new UnauthorizedException();
+      throw new BadRequestException('Current password is incorrect.');
     const secret = generateTotpSecret();
     await this.repository.setMfaSecret(
       user.id,
@@ -341,7 +346,9 @@ export class AuthService {
   async disableMfa(
     user: AuthUser,
     password: string,
-    code: string,
+    authenticatorCode: string | undefined,
+    recoveryCode: string | undefined,
+    reason: string,
     requestId?: string,
   ): Promise<void> {
     if (user.mfaRequired)
@@ -351,18 +358,8 @@ export class AuthService {
       !user.mfaSecretEncrypted ||
       !(await verifyPassword(password, user.passwordHash))
     )
-      throw new UnauthorizedException();
-    const validTotp = verifyTotp(
-      decryptSecret(user.mfaSecretEncrypted, this.encryptionKey),
-      code,
-    );
-    const validRecovery = validTotp
-      ? false
-      : await this.repository.consumeRecoveryCode(
-          user.id,
-          tokenHash(code.toUpperCase()),
-        );
-    if (!validTotp && !validRecovery) throw new UnauthorizedException();
+      throw new BadRequestException('Current password is incorrect.');
+    await this.verifyMfaStepUp(user, authenticatorCode, recoveryCode);
     await this.repository.disableMfa(user.id);
     await this.repository.event({
       actorUserId: user.id,
@@ -370,7 +367,43 @@ export class AuthService {
       eventType: 'mfa_disabled',
       outcome: 'success',
       requestId,
+      reason: reason.trim(),
     });
+  }
+
+  async verifyMfaStepUp(
+    user: AuthUser,
+    authenticatorCode?: string,
+    recoveryCode?: string,
+  ): Promise<void> {
+    if (!user.mfaEnabled) return;
+    if (!user.mfaSecretEncrypted)
+      throw new BadRequestException('MFA enrollment is incomplete.');
+    if (authenticatorCode) {
+      if (
+        !verifyTotp(
+          decryptSecret(user.mfaSecretEncrypted, this.encryptionKey),
+          authenticatorCode,
+        )
+      )
+        throw new BadRequestException('Authenticator code is invalid.');
+      return;
+    }
+    if (recoveryCode) {
+      if (
+        !(await this.repository.consumeRecoveryCode(
+          user.id,
+          tokenHash(recoveryCode.toUpperCase()),
+        ))
+      )
+        throw new BadRequestException(
+          'Recovery code is invalid or has already been used.',
+        );
+      return;
+    }
+    throw new BadRequestException(
+      'Enter a current authenticator code or one-time recovery code.',
+    );
   }
   async bootstrap(input: {
     token: string;

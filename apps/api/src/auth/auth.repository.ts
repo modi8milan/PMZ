@@ -344,8 +344,8 @@ export class AuthRepository {
     );
     await this.db.query(
       `INSERT INTO zenovel.security_events
-      (id,actor_user_id,subject_user_id,event_type,outcome,request_id,context)
-      VALUES($1,$2,$3,$4,$5,$6,$7)`,
+      (id,actor_user_id,subject_user_id,event_type,outcome,request_id,reason,context)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
       [
         randomUUID(),
         event.actorUserId ?? null,
@@ -353,6 +353,7 @@ export class AuthRepository {
         event.eventType,
         event.outcome,
         event.requestId ?? null,
+        event.reason ?? null,
         JSON.stringify(context),
       ],
     );

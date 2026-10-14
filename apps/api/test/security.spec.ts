@@ -1,9 +1,17 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { APP_GUARD } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
+import { Test } from '@nestjs/testing';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
 import type { Environment } from '../src/config/environment.js';
 import { AuthService } from '../src/auth/auth.service.js';
 import { AuthRepository } from '../src/auth/auth.repository.js';
+import { AuthenticationGuard } from '../src/auth/auth.guard.js';
+import { PermissionGuard } from '../src/auth/permission.guard.js';
+import { AuthController } from '../src/auth/auth.controller.js';
 import type {
   AuthSession,
   AuthUser,
@@ -18,10 +26,18 @@ import {
   encryptSecret,
   hashPassword,
   passwordPolicyErrors,
+  tokenHash,
   totp,
   verifyPassword,
   verifyTotp,
 } from '../src/security/security.crypto.js';
+import { AdminController } from '../src/admin/admin.controller.js';
+import { AdminService } from '../src/admin/admin.service.js';
+import { SafeLogger } from '../src/common/safe-logger.js';
+import { setup } from '../src/setup.js';
+import { DatabaseService } from '../src/database/database.service.js';
+import { UpdateUserDto } from '../src/admin/admin.dto.js';
+import { validate } from 'class-validator';
 
 const key = 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=';
 const config = new ConfigService<Environment, true>({
@@ -218,6 +234,218 @@ describe('authentication lifecycle', () => {
     } as AuthSession);
     assert.equal(repo.revoked, 'logout');
   });
+  it('rejects password change when the authenticated session is missing', async () => {
+    const repository = {
+      findSession: mock.fn(async () => null),
+      touchSession: mock.fn(async () => undefined),
+    };
+    const guardConfig = new ConfigService<Environment, true>({
+      NODE_ENV: 'test',
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+      SESSION_ABSOLUTE_HOURS: 8,
+      SESSION_IDLE_MINUTES: 30,
+      PASSWORD_EXPIRY_DAYS: 30,
+      PASSWORD_HISTORY_COUNT: 5,
+      LOGIN_MAX_FAILURES: 5,
+      LOCKOUT_MINUTES: 15,
+      RESET_TOKEN_MINUTES: 30,
+      MFA_ENCRYPTION_KEY: key,
+      BOOTSTRAP_TOKEN: 'isolated-bootstrap-token-with-32-characters',
+    } as Environment);
+    const auth = new AuthService(
+      repository as unknown as AuthRepository,
+      guardConfig,
+    );
+    const module = await Test.createTestingModule({
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthRepository, useValue: repository },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+    try {
+      await app.init();
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/auth/password')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          currentPassword: 'not-disclosed',
+          newPassword: 'Harbor-Stone-84!',
+        })
+        .expect(401);
+      assert.equal(response.body.code, 'AUTHENTICATION_REQUIRED');
+    } finally {
+      await app.close();
+    }
+  });
+  it('rejects the original session after administrator revocation', async () => {
+    const cra = user({
+      id: '00000000-0000-4000-8000-000000000011',
+      username: 'revoked.monitor',
+      roles: ['CRA_MONITOR'],
+      permissions: ['View', 'Edit', 'Comment', 'Respond'],
+    });
+    const administrator = user({
+      id: '00000000-0000-4000-8000-000000000012',
+      username: 'system.administrator',
+      roles: ['SYSTEM_ADMINISTRATOR'],
+      permissions: ['View', 'Administer', 'AuditReview'],
+    });
+    const originalCookie = 'isolated-original-cra-cookie';
+    const freshCookie = 'isolated-fresh-cra-cookie';
+    const administratorCookie = 'isolated-administrator-cookie';
+    const administratorCsrf = 'isolated-administrator-csrf';
+    type StoredSession = {
+      session: AuthSession;
+      revoked: boolean;
+      revokedReason?: string;
+    };
+    const sessions = new Map<string, StoredSession>();
+    const addSession = (
+      rawCookie: string,
+      id: string,
+      account: AuthUser,
+      csrfTokenHash: string,
+    ) => {
+      sessions.set(tokenHash(rawCookie), {
+        session: {
+          id,
+          user: account,
+          csrfTokenHash,
+          absoluteExpiresAt: new Date(Date.now() + 3_600_000),
+        },
+        revoked: false,
+      });
+    };
+    addSession(
+      originalCookie,
+      '00000000-0000-4000-8000-000000000021',
+      cra,
+      tokenHash('unused-cra-csrf'),
+    );
+    addSession(
+      administratorCookie,
+      '00000000-0000-4000-8000-000000000022',
+      administrator,
+      tokenHash(administratorCsrf),
+    );
+    const events: SecurityEvent[] = [];
+    const statefulRepository = {
+      findSession: mock.fn(async (hash: string) => {
+        const stored = sessions.get(hash);
+        return stored && !stored.revoked ? stored.session : null;
+      }),
+      touchSession: mock.fn(async () => undefined),
+      rotateCsrf: mock.fn(async (id: string, hash: string) => {
+        for (const stored of sessions.values())
+          if (stored.session.id === id && !stored.revoked)
+            stored.session.csrfTokenHash = hash;
+      }),
+      revokeUserSessions: mock.fn(async (userId: string, reason: string) => {
+        for (const stored of sessions.values())
+          if (stored.session.user.id === userId && !stored.revoked) {
+            stored.revoked = true;
+            stored.revokedReason = reason;
+          }
+      }),
+      event: mock.fn(async (event: SecurityEvent) => {
+        events.push(event);
+      }),
+    };
+    const sessionConfig = new ConfigService<Environment, true>({
+      NODE_ENV: 'test',
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+      SESSION_ABSOLUTE_HOURS: 8,
+      SESSION_IDLE_MINUTES: 30,
+      PASSWORD_EXPIRY_DAYS: 30,
+      PASSWORD_HISTORY_COUNT: 5,
+      LOGIN_MAX_FAILURES: 5,
+      LOCKOUT_MINUTES: 15,
+      RESET_TOKEN_MINUTES: 30,
+      MFA_ENCRYPTION_KEY: key,
+      BOOTSTRAP_TOKEN: 'isolated-bootstrap-token-with-32-characters',
+    } as Environment);
+    const auth = new AuthService(
+      statefulRepository as unknown as AuthRepository,
+      sessionConfig,
+    );
+    const database = { query: mock.fn() };
+    const module = await Test.createTestingModule({
+      controllers: [AuthController, AdminController],
+      providers: [
+        {
+          provide: AuthRepository,
+          useValue: statefulRepository,
+        },
+        { provide: AuthService, useValue: auth },
+        { provide: DatabaseService, useValue: database },
+        { provide: ConfigService, useValue: sessionConfig },
+        AdminService,
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+
+    try {
+      await app.init();
+      const beforeRevocation = await request(app.getHttpServer())
+        .get('/api/v1/auth/session')
+        .set('Cookie', `zenovel_session=${originalCookie}`)
+        .expect(200);
+      assert.equal(beforeRevocation.body.user.username, cra.username);
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/admin/users/${cra.id}/revoke-sessions`)
+        .set('Cookie', `zenovel_session=${administratorCookie}`)
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', administratorCsrf)
+        .send({ reason: 'Acceptance test session revocation.' })
+        .expect(201);
+
+      const original = sessions.get(tokenHash(originalCookie));
+      assert.equal(original?.revoked, true);
+      assert.equal(original?.revokedReason, 'administrator_revocation');
+      assert.equal(events.at(-1)?.eventType, 'sessions_revoked');
+
+      const afterRevocation = await request(app.getHttpServer())
+        .get('/api/v1/auth/session')
+        .set('Cookie', `zenovel_session=${originalCookie}`)
+        .expect(401);
+      assert.equal(afterRevocation.body.code, 'AUTHENTICATION_REQUIRED');
+      assert.equal(afterRevocation.body.message, 'Authentication is required.');
+      assert.equal('user' in afterRevocation.body, false);
+
+      addSession(
+        freshCookie,
+        '00000000-0000-4000-8000-000000000023',
+        cra,
+        tokenHash('unused-fresh-cra-csrf'),
+      );
+      const freshSession = await request(app.getHttpServer())
+        .get('/api/v1/auth/session')
+        .set('Cookie', `zenovel_session=${freshCookie}`)
+        .expect(200);
+      assert.equal(freshSession.body.user.username, cra.username);
+      assert.equal(database.query.mock.callCount(), 0);
+    } finally {
+      await app.close();
+    }
+  });
   it('enforces password history and the configurable 30-day expiry', async () => {
     const repo = new FakeRepository();
     repo.account = user({
@@ -243,6 +471,46 @@ describe('authentication lifecycle', () => {
     assert.ok(repo.changed);
     const days = (repo.changed!.expires.getTime() - before) / 86_400_000;
     assert.ok(days >= 29.99 && days <= 30.01);
+  });
+  it('distinguishes current-password and MFA step-up failures during password change', async () => {
+    const repo = new FakeRepository();
+    const secret = 'JBSWY3DPEHPK3PXP';
+    repo.account = user({
+      passwordHash: await hashPassword('Cedar-River-42!'),
+      mfaEnabled: true,
+      mfaSecretEncrypted: encryptSecret(secret, key),
+    });
+    const auth = service(repo);
+    await assert.rejects(
+      () => auth.changePassword(repo.account!, 'wrong', 'Harbor-Stone-84!'),
+      /Current password is incorrect/,
+    );
+    await assert.rejects(
+      () =>
+        auth.changePassword(
+          repo.account!,
+          'Cedar-River-42!',
+          'Harbor-Stone-84!',
+        ),
+      /authenticator code or one-time recovery code/,
+    );
+    await assert.rejects(
+      () =>
+        auth.changePassword(
+          repo.account!,
+          'Cedar-River-42!',
+          'Harbor-Stone-84!',
+          '000000',
+        ),
+      /Authenticator code is invalid/,
+    );
+    await auth.changePassword(
+      repo.account!,
+      'Cedar-River-42!',
+      'Harbor-Stone-84!',
+      totp(secret),
+    );
+    assert.ok(repo.changed);
   });
   it('enforces reset-token single use and first-login forced change', async () => {
     const repo = new FakeRepository();
@@ -285,14 +553,455 @@ describe('authentication lifecycle', () => {
     });
     assert.equal(repo.recoveryValid, false);
     repo.recoveryValid = true;
-    await auth.disableMfa(repo.account, 'Cedar-River-42!', 'ABCD-EFGH');
+    await auth.disableMfa(
+      repo.account,
+      'Cedar-River-42!',
+      undefined,
+      'ABCD-EFGH',
+      'Owner requested MFA disable.',
+    );
     assert.equal(repo.mfaDisabled, true);
     assert.equal(repo.events.at(-1)?.eventType, 'mfa_disabled');
   });
 });
 
+describe('user role administration', () => {
+  it('requires one or more unique role identifiers for a role update', async () => {
+    const empty = Object.assign(new UpdateUserDto(), { roleIds: [] });
+    const duplicate = Object.assign(new UpdateUserDto(), {
+      roleIds: [
+        '00000000-0000-4000-8000-000000000041',
+        '00000000-0000-4000-8000-000000000041',
+      ],
+    });
+
+    assert.ok((await validate(empty)).length > 0);
+    assert.ok((await validate(duplicate)).length > 0);
+    const whitespaceReason = Object.assign(new UpdateUserDto(), {
+      roleIds: ['00000000-0000-4000-8000-000000000041'],
+      reason: '   ',
+    });
+    assert.ok((await validate(whitespaceReason)).length > 0);
+  });
+
+  it('changes assigned roles, revokes sessions, records before and after roles, and returns the updated user', async () => {
+    const actorId = '00000000-0000-4000-8000-000000000031';
+    const userId = '00000000-0000-4000-8000-000000000032';
+    const projectManagerRoleId = '00000000-0000-4000-8000-000000000041';
+    const qmsRoleId = '00000000-0000-4000-8000-000000000042';
+    const roles = new Map([
+      [projectManagerRoleId, 'PROJECT_MANAGER'],
+      [qmsRoleId, 'QMS'],
+    ]);
+    let assignedRoles = ['CRA_MONITOR'];
+    let sessionsRevoked = false;
+    const client = {
+      query: mock.fn(async (sql: string, values: unknown[] = []) => {
+        if (sql.includes('UPDATE zenovel.users SET'))
+          return { rows: [], rowCount: 1 };
+        if (sql.includes('SELECT id,code FROM zenovel.roles')) {
+          const requested = values[0] as string[];
+          return {
+            rows: requested
+              .filter((id) => roles.has(id))
+              .map((id) => ({ id, code: roles.get(id)! })),
+            rowCount: requested.filter((id) => roles.has(id)).length,
+          };
+        }
+        if (sql.includes('DELETE FROM zenovel.user_roles')) {
+          assignedRoles = [];
+          return { rows: [], rowCount: 1 };
+        }
+        if (sql.includes('INSERT INTO zenovel.user_roles')) {
+          assignedRoles.push(roles.get(values[1] as string)!);
+          return { rows: [], rowCount: 1 };
+        }
+        if (sql.includes('UPDATE zenovel.sessions SET')) {
+          sessionsRevoked = true;
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`Unexpected transaction query: ${sql}`);
+      }),
+    };
+    const database = {
+      transaction: mock.fn(
+        async (work: (transactionClient: typeof client) => Promise<void>) =>
+          work(client),
+      ),
+      query: mock.fn(async (sql: string) => {
+        if (!sql.includes('FROM zenovel.users'))
+          throw new Error(`Unexpected database query: ${sql}`);
+        return {
+          rows: [
+            {
+              id: userId,
+              username: 'monitor.one',
+              fullName: 'Monitor One',
+              email: null,
+              status: 'active',
+              departmentId: null,
+              department: null,
+              mustChangePassword: false,
+              passwordExpiresAt: new Date(Date.now() + 86_400_000),
+              mfaEnabled: false,
+              roles: [...assignedRoles].sort(),
+            },
+          ],
+          rowCount: 1,
+        };
+      }),
+    };
+    const events: SecurityEvent[] = [];
+    const repository = {
+      findUserById: mock.fn(async () =>
+        user({ id: userId, roles: ['CRA_MONITOR'] }),
+      ),
+      event: mock.fn(async (event: SecurityEvent) => {
+        events.push(event);
+      }),
+    };
+    const admin = new AdminService(
+      database as unknown as DatabaseService,
+      repository as unknown as AuthRepository,
+      {} as AuthService,
+    );
+
+    await admin.updateUser(
+      actorId,
+      userId,
+      {
+        roleIds: [projectManagerRoleId, qmsRoleId],
+        reason: 'Project responsibilities changed.',
+      },
+      'role-change-request',
+    );
+    const updatedUsers = await admin.users();
+
+    assert.ok(updatedUsers[0]);
+    assert.deepEqual(updatedUsers[0].roles, ['PROJECT_MANAGER', 'QMS']);
+    assert.equal(sessionsRevoked, true);
+    assert.equal(events.at(-1)?.eventType, 'user_roles_changed');
+    assert.equal(events.at(-1)?.actorUserId, actorId);
+    assert.equal(events.at(-1)?.subjectUserId, userId);
+    assert.deepEqual(events.at(-1)?.context, {
+      beforeRoles: 'CRA_MONITOR',
+      afterRoles: 'PROJECT_MANAGER,QMS',
+    });
+  });
+
+  it('rejects unavailable role identifiers before replacing assignments', async () => {
+    const deleteAssignments = mock.fn();
+    const client = {
+      query: mock.fn(async (sql: string) => {
+        if (sql.includes('UPDATE zenovel.users SET'))
+          return { rows: [], rowCount: 1 };
+        if (sql.includes('SELECT id,code FROM zenovel.roles'))
+          return { rows: [], rowCount: 0 };
+        if (sql.includes('DELETE FROM zenovel.user_roles')) {
+          deleteAssignments();
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`Unexpected transaction query: ${sql}`);
+      }),
+    };
+    const database = {
+      transaction: async (
+        work: (transactionClient: typeof client) => Promise<void>,
+      ) => work(client),
+    };
+    const repository = {
+      findUserById: async () => user(),
+    };
+    const admin = new AdminService(
+      database as unknown as DatabaseService,
+      repository as unknown as AuthRepository,
+      {} as AuthService,
+    );
+
+    await assert.rejects(
+      () =>
+        admin.updateUser(user().id, '00000000-0000-4000-8000-000000000032', {
+          roleIds: ['00000000-0000-4000-8000-000000000099'],
+          reason: 'Attempt assignment validation.',
+        }),
+      /One or more roles are unavailable/,
+    );
+    assert.equal(deleteAssignments.mock.callCount(), 0);
+  });
+});
+
+describe('role-management safeguards', () => {
+  it('prevents custom administrator roles and refuses retirement with user dependencies', async () => {
+    const actorId = '00000000-0000-4000-8000-000000000081';
+    const repository = {
+      findUserById: mock.fn(async () =>
+        user({ id: actorId, roles: ['QMS'], permissions: ['AuditReview'] }),
+      ),
+    };
+    const database = {
+      transaction: mock.fn(),
+      query: mock.fn(async (sql: string) => {
+        if (sql.includes('count(ur.user_id)'))
+          return {
+            rows: [
+              { code: 'CUSTOM_ROLE', systemRole: false, assignments: '1' },
+            ],
+            rowCount: 1,
+          };
+        throw new Error(`Unexpected query: ${sql}`);
+      }),
+    };
+    const admin = new AdminService(
+      database as unknown as DatabaseService,
+      repository as unknown as AuthRepository,
+      {} as AuthService,
+    );
+    await assert.rejects(
+      () =>
+        admin.createRole(actorId, {
+          code: 'CUSTOM_ADMIN',
+          name: 'Custom administrator',
+          permissions: ['Administer'],
+          reason: 'Attempt critical grant.',
+        }),
+      /Administrator access is restricted/,
+    );
+    assert.equal(database.transaction.mock.callCount(), 0);
+    await assert.rejects(
+      () =>
+        admin.retireRole(
+          actorId,
+          '00000000-0000-4000-8000-000000000082',
+          'Role is no longer required.',
+        ),
+      /Remove this role from all users/,
+    );
+  });
+});
+
+describe('Stage 2 interface refinements', () => {
+  it('shows role editing and Audit Trail without rendering permission details', async () => {
+    const source = await readFile(
+      new URL('../../../web/components/auth-portal.tsx', import.meta.url),
+      'utf8',
+    );
+
+    assert.match(source, /Edit roles/);
+    assert.match(source, /Audit Trail/);
+    assert.match(
+      source,
+      /headings=\{\['Time Stamp', 'User', 'Change', 'Reason for Change'\]\}/,
+    );
+    assert.match(source, /Authenticator code/);
+    assert.match(source, /One-time recovery code/);
+    assert.match(source, /Apply filters/);
+    assert.match(source, /Clear filters/);
+    assert.doesNotMatch(source, /Security events/);
+    assert.doesNotMatch(source, /Permission mapping/);
+    assert.doesNotMatch(source, /permissions\.join/);
+  });
+});
+
 describe('authorization invariants', () => {
   const authorization = new AuthorizationService();
+  it('denies an authenticated CRA/Monitor access to the administrator user list', async () => {
+    const cra = user({
+      roles: ['CRA_MONITOR'],
+      permissions: ['View', 'Edit', 'Comment', 'Respond'],
+    });
+    assert.equal(cra.roles.includes('CRA_MONITOR'), true);
+    assert.equal(cra.permissions.includes('Administer'), false);
+
+    const session: AuthSession = {
+      id: '00000000-0000-4000-8000-000000000002',
+      user: cra,
+      csrfTokenHash: 'unused-for-read-only-request',
+      absoluteExpiresAt: new Date(Date.now() + 3_600_000),
+    };
+    const sessionRepository = {
+      findSession: mock.fn(async () => session),
+      touchSession: mock.fn(async () => undefined),
+    };
+    const auth = new AuthService(
+      sessionRepository as unknown as AuthRepository,
+      config,
+    );
+    const users = mock.fn(async () => []);
+    const guardConfig = new ConfigService<Environment, true>({
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+    } as Environment);
+    const module = await Test.createTestingModule({
+      controllers: [AdminController],
+      providers: [
+        { provide: AdminService, useValue: { users } },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+
+    try {
+      await app.init();
+      const response = await request(app.getHttpServer())
+        .get('/api/v1/admin/users')
+        .set('Cookie', 'zenovel_session=isolated-cra-session')
+        .expect(403);
+
+      assert.equal(response.body.code, 'ACCESS_DENIED');
+      assert.equal(response.body.message, 'Access is denied.');
+      assert.equal(sessionRepository.findSession.mock.callCount(), 1);
+      assert.equal(users.mock.callCount(), 0);
+    } finally {
+      await app.close();
+    }
+  });
+  it('denies an authenticated CRA/Monitor a direct user-role update', async () => {
+    const craCsrf = 'isolated-cra-role-edit-csrf';
+    const cra: AuthUser = user({
+      roles: ['CRA_MONITOR'],
+      permissions: ['View', 'Edit', 'Comment', 'Respond'],
+    });
+    const session: AuthSession = {
+      id: '00000000-0000-4000-8000-000000000003',
+      user: cra,
+      csrfTokenHash: tokenHash(craCsrf),
+      absoluteExpiresAt: new Date(Date.now() + 3_600_000),
+    };
+    const sessionRepository = {
+      findSession: mock.fn(async () => session),
+      touchSession: mock.fn(async () => undefined),
+    };
+    const auth = new AuthService(
+      sessionRepository as unknown as AuthRepository,
+      config,
+    );
+    const updateUser = mock.fn(async () => ({ success: true }));
+    const guardConfig = new ConfigService<Environment, true>({
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+    } as Environment);
+    const module = await Test.createTestingModule({
+      controllers: [AdminController],
+      providers: [
+        { provide: AdminService, useValue: { updateUser } },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+
+    try {
+      await app.init();
+      const response = await request(app.getHttpServer())
+        .patch('/api/v1/admin/users/00000000-0000-4000-8000-000000000032')
+        .set('Cookie', 'zenovel_session=isolated-cra-role-edit-session')
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', craCsrf)
+        .send({ roleIds: ['00000000-0000-4000-8000-000000000041'] })
+        .expect(403);
+
+      assert.equal(response.body.code, 'ACCESS_DENIED');
+      assert.equal(response.body.message, 'Access is denied.');
+      assert.equal(updateUser.mock.callCount(), 0);
+    } finally {
+      await app.close();
+    }
+  });
+  it('allows QMS role configuration while denying other business roles', async () => {
+    const csrf = 'isolated-role-manager-csrf';
+    const qmsCookie = 'isolated-qms-role-manager';
+    const craCookie = 'isolated-cra-role-manager';
+    const sessions = new Map([
+      [
+        tokenHash(qmsCookie),
+        {
+          id: '00000000-0000-4000-8000-000000000071',
+          user: user({ roles: ['QMS'], permissions: ['View', 'AuditReview'] }),
+          csrfTokenHash: tokenHash(csrf),
+          absoluteExpiresAt: new Date(Date.now() + 3_600_000),
+        } as AuthSession,
+      ],
+      [
+        tokenHash(craCookie),
+        {
+          id: '00000000-0000-4000-8000-000000000072',
+          user: user({ roles: ['CRA_MONITOR'], permissions: ['View', 'Edit'] }),
+          csrfTokenHash: tokenHash(csrf),
+          absoluteExpiresAt: new Date(Date.now() + 3_600_000),
+        } as AuthSession,
+      ],
+    ]);
+    const repository = {
+      findSession: mock.fn(async (hash: string) => sessions.get(hash) ?? null),
+      touchSession: mock.fn(async () => undefined),
+    };
+    const auth = new AuthService(
+      repository as unknown as AuthRepository,
+      config,
+    );
+    const createRole = mock.fn(async () => ({ id: 'role-id' }));
+    const guardConfig = new ConfigService<Environment, true>({
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+    } as Environment);
+    const module = await Test.createTestingModule({
+      controllers: [AdminController],
+      providers: [
+        { provide: AdminService, useValue: { createRole } },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+    const body = {
+      code: 'CUSTOM_REVIEWER',
+      name: 'Custom Reviewer',
+      permissions: ['View'],
+      reason: 'Approved quality role configuration.',
+    };
+    try {
+      await app.init();
+      await request(app.getHttpServer())
+        .post('/api/v1/admin/roles')
+        .set('Cookie', `zenovel_session=${qmsCookie}`)
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', csrf)
+        .send(body)
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/admin/roles')
+        .set('Cookie', `zenovel_session=${craCookie}`)
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', csrf)
+        .send(body)
+        .expect(403);
+      assert.equal(createRole.mock.callCount(), 1);
+    } finally {
+      await app.close();
+    }
+  });
   it('allows report download only for the three approved role categories', () => {
     for (const role of ['ASSOCIATE_DIRECTOR_GCP', 'PROJECT_MANAGER', 'QMS'])
       assert.equal(
@@ -349,14 +1058,43 @@ describe('security-event secret exclusion', () => {
     await repository.event({
       eventType: 'test',
       outcome: 'success',
+      reason: 'Approved regression verification.',
       context: {
         password: 'hidden',
         resetToken: 'hidden',
         safeCode: 'allowed',
       },
     });
-    const context = JSON.parse(String(values[6]));
+    const context = JSON.parse(String(values[7]));
+    assert.equal(values[6], 'Approved regression verification.');
     assert.deepEqual(context, { safeCode: 'allowed' });
     assert.doesNotMatch(JSON.stringify(values), /hidden/);
+  });
+  it('filters the complete audit query by date, user and reason', async () => {
+    let queryValues: unknown[] = [];
+    const database = {
+      query: mock.fn(async (_sql: string, values: unknown[]) => {
+        queryValues = values;
+        return { rows: [{ id: 'event-id' }], rowCount: 1 };
+      }),
+    };
+    const admin = new AdminService(
+      database as unknown as DatabaseService,
+      {} as AuthRepository,
+      {} as AuthService,
+    );
+    const events = await admin.events({
+      from: '2026-10-01',
+      to: '2026-10-14',
+      user: 'quality.user',
+      reason: 'approved change',
+    });
+    assert.equal(events.length, 1);
+    assert.deepEqual(queryValues, [
+      '2026-10-01',
+      '2026-10-14',
+      'quality.user',
+      'approved change',
+    ]);
   });
 });

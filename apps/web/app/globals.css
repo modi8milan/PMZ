@@ -788,6 +788,51 @@ tbody th small {
   gap: 8px;
   font-size: 12px;
 }
+.role-editor {
+  min-width: 280px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.role-editor legend {
+  font-weight: 700;
+}
+.role-editor .permission-grid {
+  margin: 8px 0;
+}
+.role-editor > small {
+  display: block;
+  color: var(--muted);
+}
+.role-editor .inline-controls {
+  margin-top: 10px;
+}
+.access-rights-editor {
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.access-rights-editor legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+.access-rights-editor small,
+.audit-user small {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.audit-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+  align-items: end;
+}
+.audit-filters .inline-controls {
+  grid-column: 1 / -1;
+}
 @media (max-width: 900px) {
   .auth-shell {
     display: block;
@@ -797,6 +842,9 @@ tbody th small {
   .auth-brand {
     color: var(--brand-ink);
     margin: 0 auto 20px;
+  }
+  .audit-filters {
+    grid-template-columns: 1fr;
   }
   .auth-brand .brand {
     background: var(--brand-ink);

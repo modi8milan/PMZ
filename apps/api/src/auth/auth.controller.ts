@@ -94,6 +94,7 @@ export class AuthController {
   ) {
     const result = await this.auth.login({
       ...body,
+      mfaCode: body.authenticatorCode ?? body.recoveryCode ?? body.mfaCode,
       ip: request.ip,
       userAgent: request.headers['user-agent'],
       requestId: this.requestId(response),
@@ -131,6 +132,8 @@ export class AuthController {
       request.auth!.user,
       body.currentPassword,
       body.newPassword,
+      body.authenticatorCode,
+      body.recoveryCode,
       this.requestId(response),
     );
     this.clearCookie(response);
@@ -200,7 +203,9 @@ export class AuthController {
     await this.auth.disableMfa(
       request.auth!.user,
       body.password,
-      body.code,
+      body.authenticatorCode,
+      body.recoveryCode,
+      body.reason,
       this.requestId(response),
     );
     this.clearCookie(response);
