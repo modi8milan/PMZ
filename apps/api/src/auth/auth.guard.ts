@@ -26,6 +26,10 @@ function cookie(request: Request, name: string): string {
   return '';
 }
 
+function isSystemAdministrator(request: AuthenticatedRequest): boolean {
+  return Boolean(request.auth?.user.roles.includes('SYSTEM_ADMINISTRATOR'));
+}
+
 @Injectable()
 export class AuthenticationGuard implements CanActivate {
   private readonly cookieName: string;
@@ -67,7 +71,7 @@ export class AuthenticationGuard implements CanActivate {
     );
     if (
       !expired &&
-      session.user.mfaRequired &&
+      isSystemAdministrator(request) &&
       !session.user.mfaEnabled &&
       !mfaSetupAllowed
     )

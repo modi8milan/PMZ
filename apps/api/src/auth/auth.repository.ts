@@ -226,21 +226,24 @@ export class AuthRepository {
     const id = randomUUID();
     await this.db.query(
       `INSERT INTO zenovel.password_reset_tokens(id,user_id,token_hash,created_by,expires_at,requires_password_change)
-      VALUES($1,$2,$3,$4,$5,true)`,
+      VALUES($1,$2,$3,$4,$5,false)`,
       [id, userId, tokenHashValue, createdBy, expiresAt],
     );
     return id;
   }
   async consumeReset(
+    username: string,
     tokenHashValue: string,
     passwordHash: string,
     expiresAt: Date,
   ): Promise<string | null> {
     return this.db.transaction(async (client) => {
       const token = await client.query<{ id: string; user_id: string }>(
-        `SELECT id,user_id FROM zenovel.password_reset_tokens
-        WHERE token_hash=$1 AND used_at IS NULL AND expires_at > now() FOR UPDATE`,
-        [tokenHashValue],
+        `SELECT t.id,t.user_id FROM zenovel.password_reset_tokens t
+        JOIN zenovel.users u ON u.id=t.user_id
+        WHERE t.token_hash=$1 AND lower(u.username)=lower($2)
+        AND t.used_at IS NULL AND t.expires_at > now() FOR UPDATE OF t`,
+        [tokenHashValue, username],
       );
       const row = token.rows[0];
       if (!row) return null;
@@ -259,7 +262,7 @@ export class AuthRepository {
       );
       await client.query(
         `UPDATE zenovel.users SET password_hash=$2,password_changed_at=now(),password_expires_at=$3,
-        must_change_password=true,auth_version=auth_version+1,updated_at=now() WHERE id=$1`,
+        must_change_password=false,auth_version=auth_version+1,updated_at=now() WHERE id=$1`,
         [row.user_id, passwordHash, expiresAt],
       );
       await client.query(
@@ -269,11 +272,16 @@ export class AuthRepository {
       return row.user_id;
     });
   }
-  async findResetUser(tokenHashValue: string): Promise<AuthUser | null> {
+  async findResetUser(
+    username: string,
+    tokenHashValue: string,
+  ): Promise<AuthUser | null> {
     const result = await this.db.query<UserRow>(
       `SELECT u.* FROM zenovel.password_reset_tokens t
-      JOIN zenovel.users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.used_at IS NULL AND t.expires_at>now()`,
-      [tokenHashValue],
+      JOIN zenovel.users u ON u.id=t.user_id
+      WHERE t.token_hash=$1 AND lower(u.username)=lower($2)
+      AND t.used_at IS NULL AND t.expires_at>now()`,
+      [tokenHashValue, username],
     );
     return result.rows[0] ? this.mapUser(result.rows[0]) : null;
   }

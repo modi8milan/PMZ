@@ -9,6 +9,7 @@ import { AuthModule } from './auth/auth.module.js';
 import { AdminModule } from './admin/admin.module.js';
 import { AuthenticationGuard } from './auth/auth.guard.js';
 import { PermissionGuard } from './auth/permission.guard.js';
+import { ProjectsModule } from './projects/projects.module.js';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { PermissionGuard } from './auth/permission.guard.js';
     DatabaseModule,
     AuthModule,
     AdminModule,
+    ProjectsModule,
     HealthModule,
   ],
   providers: [

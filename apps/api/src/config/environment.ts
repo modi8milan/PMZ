@@ -13,6 +13,14 @@ const origin = z.string().refine((value) => {
     return false;
   }
 });
+const timeZone = z.string().refine((value) => {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+});
 const schema = z.object({
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
@@ -41,6 +49,13 @@ const schema = z.object({
   DB_TIMEOUT_MS: z.coerce.number().int().min(500).max(10000).default(3000),
   RATE_LIMIT: z.coerce.number().int().min(1).max(1000).default(60),
   RATE_TTL_MS: z.coerce.number().int().min(1000).max(3600000).default(60000),
+  BUSINESS_TIME_ZONE: timeZone.default('Asia/Kolkata'),
+  OVERDUE_PROCESSING_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(86400000)
+    .default(60000),
   PASSWORD_EXPIRY_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   PASSWORD_HISTORY_COUNT: z.coerce.number().int().min(1).max(20).default(5),
   SESSION_IDLE_MINUTES: z.coerce.number().int().min(5).max(1440).default(30),

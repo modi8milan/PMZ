@@ -132,7 +132,7 @@ export class AdminService {
       id,
       resetToken,
       delivery:
-        'Provide this single-use token through an approved out-of-band channel.',
+        'Provide this 10-digit, single-use setup token through an approved out-of-band channel.',
     };
   }
   async updateUser(
@@ -295,11 +295,15 @@ export class AdminService {
         reason,
       ),
       delivery:
-        'Provide this single-use token through an approved out-of-band channel.',
+        'Provide this 10-digit, single-use setup token through an approved out-of-band channel.',
     };
   }
   async createRole(actorId: string, input: CreateRoleDto, requestId?: string) {
     await this.roleManager(actorId);
+    if (input.mfaRequired)
+      throw new BadRequestException(
+        'MFA can be required only for the protected System Administrator role.',
+      );
     const reason = this.requiredReason(input.reason);
     const id = randomUUID();
     if (input.permissions.includes('Administer'))
@@ -435,6 +439,10 @@ export class AdminService {
     requestId?: string,
   ) {
     const actor = await this.roleManager(actorId);
+    if (input.mfaRequired)
+      throw new BadRequestException(
+        'MFA can be required only for the protected System Administrator role.',
+      );
     const reason = this.requiredReason(input.reason);
     const role = await this.db.query<{ code: string; systemRole: boolean }>(
       'SELECT code,system_role AS "systemRole" FROM zenovel.roles WHERE id=$1',

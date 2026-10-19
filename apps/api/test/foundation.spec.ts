@@ -10,6 +10,7 @@ import { DatabaseService } from '../src/database/database.service.js';
 import { SafeLogger } from '../src/common/safe-logger.js';
 import { setup } from '../src/setup.js';
 import { validateEnvironment } from '../src/config/environment.js';
+import { OverdueProcessor } from '../src/projects/overdue.processor.js';
 
 const env = {
   DATABASE_URL: 'postgresql://test:test@127.0.0.1:5432/test',
@@ -33,6 +34,7 @@ const { AppModule } = await import('../src/app.module.js');
 describe('configuration', () => {
   it('accepts local configuration and coerces limits', () => {
     assert.equal(validateEnvironment(env).RATE_LIMIT, 3);
+    assert.equal(validateEnvironment(env).BUSINESS_TIME_ZONE, 'Asia/Kolkata');
   });
   for (const override of [
     { DATABASE_URL: 'postgresql://secret:secret@production.example/db' },
@@ -40,6 +42,7 @@ describe('configuration', () => {
     { HOST: '0.0.0.0' },
     { PORT: '-1' },
     { DATABASE_URL: 'not-a-url' },
+    { BUSINESS_TIME_ZONE: 'Mars/Olympus' },
     {
       DATABASE_URL:
         'postgresql://test:REPLACE_WITH_LOCAL_PASSWORD@127.0.0.1/test',
@@ -68,6 +71,8 @@ describe('API foundation (mocked database)', () => {
     const module = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(DatabaseService)
       .useValue({ probe })
+      .overrideProvider(OverdueProcessor)
+      .useValue({})
       .compile();
     app = module.createNestApplication<NestExpressApplication>({
       logger: false,

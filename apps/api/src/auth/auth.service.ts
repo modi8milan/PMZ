@@ -1,7 +1,11 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -13,6 +17,7 @@ import {
   generateTotpSecret,
   hashPassword,
   passwordPolicyErrors,
+  randomNumericToken,
   randomToken,
   tokenHash,
   verifyPassword,
@@ -27,6 +32,12 @@ export type LoginResult = {
   session: AuthSession;
 };
 
+const SYSTEM_ADMINISTRATOR_ROLE = 'SYSTEM_ADMINISTRATOR';
+
+function isSystemAdministrator(user: Pick<AuthUser, 'roles'>): boolean {
+  return user.roles.includes(SYSTEM_ADMINISTRATOR_ROLE);
+}
+
 @Injectable()
 export class AuthService {
   private readonly dummyPasswordHash = hashPassword(randomToken(32));
@@ -38,6 +49,10 @@ export class AuthService {
   private readonly lockoutMinutes: number;
   private readonly resetMinutes: number;
   private readonly encryptionKey: string;
+  private readonly resetFailures = new Map<
+    string,
+    { attempts: number; blockedUntil: number; updatedAt: number }
+  >();
   constructor(
     private readonly repository: AuthRepository,
     config: ConfigService<Environment, true>,
@@ -70,6 +85,32 @@ export class AuthService {
   }
   private genericFailure(): never {
     throw new UnauthorizedException('Invalid credentials.');
+  }
+  private resetAttemptKey(username: string, ip?: string): string {
+    return tokenHash(
+      `${username.trim().toLowerCase()}\u0000${ip ?? 'unknown'}`,
+    );
+  }
+  private assertResetAttemptAllowed(key: string): void {
+    const now = Date.now();
+    const state = this.resetFailures.get(key);
+    if (state && state.blockedUntil > now)
+      throw new HttpException(
+        'Too many setup attempts. Try again later.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    if (state && now - state.updatedAt > 10 * 60_000)
+      this.resetFailures.delete(key);
+  }
+  private recordResetFailure(key: string): void {
+    const now = Date.now();
+    const previous = this.resetFailures.get(key);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    this.resetFailures.set(key, {
+      attempts,
+      blockedUntil: attempts >= 5 ? now + 5 * 60_000 : 0,
+      updatedAt: now,
+    });
   }
 
   async login(input: {
@@ -105,7 +146,7 @@ export class AuthService {
       });
       return this.genericFailure();
     }
-    if (user.mfaEnabled) {
+    if (isSystemAdministrator(user) && user.mfaEnabled) {
       if (!user.mfaSecretEncrypted || !input.mfaCode) {
         await this.repository.event({
           subjectUserId: user.id,
@@ -113,7 +154,9 @@ export class AuthService {
           outcome: 'failure',
           requestId: input.requestId,
         });
-        return this.genericFailure();
+        throw new BadRequestException(
+          'Enter your System Administrator authenticator code or one-time recovery code.',
+        );
       }
       const secret = decryptSecret(user.mfaSecretEncrypted, this.encryptionKey);
       const validTotp = verifyTotp(secret, input.mfaCode);
@@ -130,7 +173,9 @@ export class AuthService {
           outcome: 'failure',
           requestId: input.requestId,
         });
-        return this.genericFailure();
+        throw new BadRequestException(
+          'System Administrator MFA verification failed. Check the code and try again.',
+        );
       }
       await this.repository.event({
         actorUserId: user.id,
@@ -247,13 +292,29 @@ export class AuthService {
   ): Promise<string> {
     const user = await this.repository.findUserById(userId);
     if (!user) throw new BadRequestException();
-    const token = randomToken();
-    await this.repository.issueReset(
-      userId,
-      tokenHash(token),
-      actorId,
-      new Date(Date.now() + this.resetMinutes * 60_000),
-    );
+    let token = '';
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const candidate = randomNumericToken(10);
+      try {
+        await this.repository.issueReset(
+          userId,
+          tokenHash(candidate),
+          actorId,
+          new Date(Date.now() + this.resetMinutes * 60_000),
+        );
+        token = candidate;
+        break;
+      } catch (error) {
+        if (
+          typeof error !== 'object' ||
+          error === null ||
+          !('code' in error) ||
+          error.code !== '23505'
+        )
+          throw error;
+      }
+    }
+    if (!token) throw new ServiceUnavailableException();
     await this.repository.event({
       actorUserId: actorId,
       subjectUserId: userId,
@@ -265,23 +326,43 @@ export class AuthService {
     return token;
   }
   async completeReset(
+    username: string,
     token: string,
     password: string,
+    ip?: string,
     requestId?: string,
   ): Promise<void> {
-    if (!token) throw new BadRequestException();
+    const identity = username.trim();
+    const attemptKey = this.resetAttemptKey(identity, ip);
+    this.assertResetAttemptAllowed(attemptKey);
+    if (!token) {
+      this.recordResetFailure(attemptKey);
+      throw new BadRequestException(
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+    }
     const resetHash = tokenHash(token);
-    const user = await this.repository.findResetUser(resetHash);
-    if (!user)
-      throw new BadRequestException('Reset token is invalid or expired.');
+    const user = await this.repository.findResetUser(identity, resetHash);
+    if (!user) {
+      this.recordResetFailure(attemptKey);
+      throw new BadRequestException(
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+    }
     await this.assertNewPassword(user, password);
     const userId = await this.repository.consumeReset(
+      identity,
       resetHash,
       await hashPassword(password),
       this.passwordExpiry(),
     );
-    if (!userId)
-      throw new BadRequestException('Reset token is invalid or expired.');
+    if (!userId) {
+      this.recordResetFailure(attemptKey);
+      throw new BadRequestException(
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+    }
+    this.resetFailures.delete(attemptKey);
     await this.repository.event({
       subjectUserId: userId,
       eventType: 'password_reset_completed',
@@ -294,6 +375,10 @@ export class AuthService {
     password: string,
     requestId?: string,
   ): Promise<{ secret: string; uri: string }> {
+    if (!isSystemAdministrator(user))
+      throw new ForbiddenException(
+        'MFA is available only to the System Administrator.',
+      );
     if (!(await verifyPassword(password, user.passwordHash)))
       throw new BadRequestException('Current password is incorrect.');
     const secret = generateTotpSecret();
@@ -319,6 +404,10 @@ export class AuthService {
     requestId?: string,
   ): Promise<string[]> {
     const user = await this.repository.findUserById(userId);
+    if (user && !isSystemAdministrator(user))
+      throw new ForbiddenException(
+        'MFA is available only to the System Administrator.',
+      );
     if (
       !user?.mfaSecretEncrypted ||
       !verifyTotp(
@@ -351,8 +440,14 @@ export class AuthService {
     reason: string,
     requestId?: string,
   ): Promise<void> {
+    if (!isSystemAdministrator(user))
+      throw new ForbiddenException(
+        'MFA is available only to the System Administrator.',
+      );
     if (user.mfaRequired)
-      throw new BadRequestException('MFA is required by an assigned role.');
+      throw new BadRequestException(
+        'System Administrator MFA cannot be disabled.',
+      );
     if (
       !user.mfaEnabled ||
       !user.mfaSecretEncrypted ||
@@ -376,7 +471,7 @@ export class AuthService {
     authenticatorCode?: string,
     recoveryCode?: string,
   ): Promise<void> {
-    if (!user.mfaEnabled) return;
+    if (!isSystemAdministrator(user) || !user.mfaEnabled) return;
     if (!user.mfaSecretEncrypted)
       throw new BadRequestException('MFA enrollment is incomplete.');
     if (authenticatorCode) {

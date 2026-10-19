@@ -23,8 +23,23 @@ export class RecoveryRequestDto {
   @IsString() @MinLength(1) @MaxLength(100) username!: string;
 }
 export class ResetPasswordDto {
-  @IsString() @MinLength(20) @MaxLength(256) token!: string;
-  @IsString() @MinLength(12) @MaxLength(256) newPassword!: string;
+  @IsString({ message: 'User ID is required.' })
+  @MinLength(1, { message: 'User ID is required.' })
+  @MaxLength(100, { message: 'User ID is invalid.' })
+  username!: string;
+
+  @IsString({ message: 'Setup token is required.' })
+  @Matches(/^(?:\d{10}|[A-Za-z0-9_-]{20,256})$/, {
+    message: 'Setup token must contain exactly 10 digits.',
+  })
+  token!: string;
+
+  @IsString({ message: 'New password is required.' })
+  @MinLength(12, {
+    message: 'New password must be at least 12 characters.',
+  })
+  @MaxLength(256, { message: 'New password is too long.' })
+  newPassword!: string;
 }
 export class MfaEnrollDto {
   @IsString() @MaxLength(256) password!: string;

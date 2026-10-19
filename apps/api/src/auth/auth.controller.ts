@@ -28,6 +28,7 @@ export class AuthController {
   private readonly secure: boolean;
   private readonly absoluteMs: number;
   private readonly bootstrapToken: string;
+  private readonly businessTimeZone: string;
   constructor(
     private readonly auth: AuthService,
     private readonly repository: AuthRepository,
@@ -38,6 +39,8 @@ export class AuthController {
     this.absoluteMs =
       config.get('SESSION_ABSOLUTE_HOURS', { infer: true }) * 3_600_000;
     this.bootstrapToken = config.get('BOOTSTRAP_TOKEN', { infer: true });
+    this.businessTimeZone =
+      config.get('BUSINESS_TIME_ZONE', { infer: true }) ?? 'Asia/Kolkata';
   }
   private requestId(response: Response): string | undefined {
     return response.locals.requestId as string | undefined;
@@ -60,6 +63,9 @@ export class AuthController {
     });
   }
   private sessionBody(session: AuthSession, csrfToken?: string) {
+    const systemAdministrator = session.user.roles.includes(
+      'SYSTEM_ADMINISTRATOR',
+    );
     const passwordExpired =
       session.user.mustChangePassword ||
       session.user.passwordExpiresAt.getTime() <= Date.now();
@@ -72,14 +78,14 @@ export class AuthController {
         departmentId: session.user.departmentId,
         roles: session.user.roles,
         permissions: session.user.permissions,
-        mfaEnabled: session.user.mfaEnabled,
-        mfaRequired: session.user.mfaRequired,
+        mfaEnabled: systemAdministrator && session.user.mfaEnabled,
+        mfaRequired: systemAdministrator,
       },
-      mfaEnrollmentRequired:
-        session.user.mfaRequired && !session.user.mfaEnabled,
+      mfaEnrollmentRequired: systemAdministrator && !session.user.mfaEnabled,
       passwordExpired,
       passwordExpiresAt: session.user.passwordExpiresAt.toISOString(),
       sessionExpiresAt: session.absoluteExpiresAt.toISOString(),
+      businessTimeZone: this.businessTimeZone,
       ...(csrfToken ? { csrfToken } : {}),
     };
   }
@@ -157,14 +163,17 @@ export class AuthController {
   @Post('reset')
   async reset(
     @Body() body: ResetPasswordDto,
+    @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
     await this.auth.completeReset(
+      body.username,
       body.token,
       body.newPassword,
+      request.ip,
       this.requestId(response),
     );
-    return { success: true, passwordChangeRequired: true };
+    return { success: true, loginRequired: true };
   }
   @AllowMfaSetup()
   @Post('mfa/enroll')

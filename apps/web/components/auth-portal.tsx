@@ -4,6 +4,7 @@ import Image from 'next/image';
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { apiBaseUrl } from '../lib/config';
 import { Badge, Button, Card, Feedback, Field, Table } from './ui';
+import { ProjectsPortal } from './projects-portal';
 
 type Session = {
   user: {
@@ -18,6 +19,7 @@ type Session = {
   passwordExpired: boolean;
   passwordExpiresAt: string;
   sessionExpiresAt: string;
+  businessTimeZone: string;
   csrfToken: string;
   mfaEnrollmentRequired: boolean;
 };
@@ -94,10 +96,11 @@ async function call<T>(
     );
   return body as T;
 }
-const displayDate = (value: string) =>
+const displayDate = (value: string, timeZone: string) =>
   new Intl.DateTimeFormat(undefined, {
     dateStyle: 'medium',
     timeStyle: 'short',
+    timeZone,
   }).format(new Date(value));
 
 export function AuthPortal() {
@@ -144,7 +147,13 @@ export function AuthPortal() {
     );
   if (!session)
     return (
-      <SignIn onLogin={setSession} act={act} error={error} notice={notice} />
+      <SignIn
+        onLogin={setSession}
+        act={act}
+        notify={setNotice}
+        error={error}
+        notice={notice}
+      />
     );
   if (session.passwordExpired)
     return (
@@ -176,6 +185,16 @@ export function AuthPortal() {
   const roleManager = session.user.roles.some((role) =>
     ['QMS', 'SYSTEM_ADMINISTRATOR'].includes(role),
   );
+  const projects = session.user.roles.some((role) =>
+    [
+      'ASSOCIATE_DIRECTOR_GCP',
+      'PROJECT_MANAGER',
+      'CRA_MONITOR',
+      'QMS',
+      'DIRECTOR',
+      'DIRECTOR_OPERATIONS',
+    ].includes(role),
+  );
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main">
@@ -183,8 +202,8 @@ export function AuthPortal() {
       </a>
       <aside className="sidebar">
         <Brand />
-        <div className="workspace-label">ACCESS CONTROL</div>
-        <nav aria-label="Stage 2 navigation">
+        <div className="workspace-label">ZENOVEL WORKSPACE</div>
+        <nav aria-label="Application navigation">
           <Nav active={view === 'account'} onClick={() => setView('account')}>
             Account
           </Nav>
@@ -203,17 +222,26 @@ export function AuthPortal() {
               Audit Trail
             </Nav>
           )}
+          {projects && (
+            <Nav
+              active={view === 'projects'}
+              onClick={() => setView('projects')}
+            >
+              Projects & tracking
+            </Nav>
+          )}
         </nav>
         <div className="sidebar-note">
-          <span className="small-label">STAGE 2 BOUNDARY</span>
-          <p>Identity and access</p>
-          <small>Project and monitoring workflows remain unavailable.</small>
+          <span className="small-label">CURRENT DELIVERY</span>
+          <p>Projects and tracking</p>
+          <small>Stage 3 foundations with Stage 2 access controls.</small>
         </div>
       </aside>
       <div className="workspace">
         <header className="topbar">
           <span>
-            ZENOVEL <span className="separator">/</span> Access Control
+            ZENOVEL <span className="separator">/</span>{' '}
+            {view === 'projects' ? 'Projects & Tracking' : 'Access Control'}
           </span>
           <div className="header-actions">
             <Badge tone="success">Authenticated</Badge>
@@ -244,11 +272,14 @@ export function AuthPortal() {
                   ? 'User administration'
                   : view === 'access'
                     ? 'Roles and permissions'
-                    : 'Audit Trail'}
+                    : view === 'events'
+                      ? 'Audit Trail'
+                      : 'Projects and project tracking'}
             </h1>
             <p className="intro-copy">
-              Backend-authoritative authentication, session and permission
-              controls for Stage 2.
+              {view === 'projects'
+                ? 'Role-scoped projects, visit tracking, deadlines and controlled milestones.'
+                : 'Backend-authoritative authentication, session and permission controls.'}
             </p>
           </div>
           {error && <Feedback error>{error}</Feedback>}
@@ -272,9 +303,12 @@ export function AuthPortal() {
             <Access session={session} act={sessionAct} notify={setNotice} />
           )}{' '}
           {view === 'events' && audit && <Events session={session} />}
+          {view === 'projects' && projects && (
+            <ProjectsPortal session={session} notify={setNotice} />
+          )}
           <footer className="page-footer">
             <span>ZENOVEL Pharma Services</span>
-            <span>Master Architecture v1.1 · Stage 2 only</span>
+            <span>Master Architecture v1.1 · Stage 3 projects</span>
           </footer>
         </main>
       </div>
@@ -342,11 +376,13 @@ function Gate({
 function SignIn({
   onLogin,
   act,
+  notify,
   error,
   notice,
 }: {
   onLogin: (s: Session) => void;
   act: (w: () => Promise<void>) => Promise<void>;
+  notify: (message: string) => void;
   error: string;
   notice: string;
 }) {
@@ -355,33 +391,67 @@ function SignIn({
   const [password, setPassword] = useState('');
   const [authenticatorCode, setAuthenticatorCode] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
+  const [administratorMfaRequested, setAdministratorMfaRequested] =
+    useState(false);
   const [token, setToken] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const selectMode = (nextMode: 'login' | 'recovery' | 'reset') => {
+    setMode(nextMode);
+    setPassword('');
+    setConfirmPassword('');
+    setAuthenticatorCode('');
+    setRecoveryCode('');
+    setAdministratorMfaRequested(false);
+    if (nextMode !== 'reset') setToken('');
+  };
   const submit = (e: FormEvent) => {
     e.preventDefault();
     void act(async () => {
-      if (mode === 'login')
-        onLogin(
-          await call<Session>('/auth/login', {
-            method: 'POST',
-            body: JSON.stringify({
-              username,
-              password,
-              authenticatorCode: authenticatorCode || undefined,
-              recoveryCode: recoveryCode || undefined,
+      if (mode === 'login') {
+        try {
+          onLogin(
+            await call<Session>('/auth/login', {
+              method: 'POST',
+              body: JSON.stringify({
+                username,
+                password,
+                authenticatorCode: administratorMfaRequested
+                  ? authenticatorCode || undefined
+                  : undefined,
+                recoveryCode: administratorMfaRequested
+                  ? recoveryCode || undefined
+                  : undefined,
+              }),
             }),
-          }),
-        );
-      else if (mode === 'recovery')
+          );
+        } catch (loginError) {
+          if (
+            loginError instanceof ApiError &&
+            loginError.message.includes('System Administrator')
+          )
+            setAdministratorMfaRequested(true);
+          throw loginError;
+        }
+      } else if (mode === 'recovery')
         await call('/auth/recovery', {
           method: 'POST',
           body: JSON.stringify({ username }),
         });
       else {
+        if (password !== confirmPassword)
+          throw new Error('New password and confirmation do not match.');
         await call('/auth/reset', {
           method: 'POST',
-          body: JSON.stringify({ token, newPassword: password }),
+          body: JSON.stringify({
+            username: username.trim(),
+            token: token.trim(),
+            newPassword: password,
+          }),
         });
-        setMode('login');
+        selectMode('login');
+        notify(
+          'Password set successfully. Sign in with your username and new password.',
+        );
       }
     });
   };
@@ -398,27 +468,31 @@ function SignIn({
             ? 'Sign in'
             : mode === 'recovery'
               ? 'Recover access'
-              : 'Complete password reset'}
+              : 'Set up your password'}
         </h1>
         {error && <Feedback error>{error}</Feedback>}
         {notice && <Feedback>{notice}</Feedback>}
         <form onSubmit={submit}>
-          {mode !== 'reset' && (
-            <Field
-              id="username"
-              label="Username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              autoComplete="username"
-              required
-            />
-          )}
+          <Field
+            id="username"
+            label="User ID"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="username"
+            required
+          />
           {mode === 'reset' && (
             <Field
               id="token"
-              label="Single-use reset token"
+              label="10-digit setup token"
               value={token}
               onChange={(e) => setToken(e.target.value)}
+              inputMode="numeric"
+              pattern="(?:[0-9]{10}|[A-Za-z0-9_-]{20,256})"
+              maxLength={256}
+              autoComplete="off"
+              spellCheck={false}
+              hint="Enter the 10-digit token supplied by your administrator. Previously issued setup tokens remain valid until they expire."
               required
             />
           )}
@@ -434,9 +508,26 @@ function SignIn({
                 mode === 'login' ? 'current-password' : 'new-password'
               }
               required
+              hint={
+                mode === 'reset'
+                  ? 'Use 12 or more characters with letters and numbers. Do not include your username or reuse a recent password.'
+                  : undefined
+              }
             />
           )}
-          {mode === 'login' && (
+          {mode === 'reset' && (
+            <Field
+              id="confirm-reset-password"
+              label="Confirm new password"
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              minLength={12}
+              autoComplete="new-password"
+              required
+            />
+          )}
+          {mode === 'login' && administratorMfaRequested && (
             <>
               <Field
                 id="authenticator-code"
@@ -467,19 +558,23 @@ function SignIn({
               ? 'Sign in securely'
               : mode === 'recovery'
                 ? 'Request recovery'
-                : 'Set new password'}
+                : 'Create password'}
           </Button>
         </form>
         <div className="auth-links">
           <button
-            onClick={() => setMode(mode === 'recovery' ? 'login' : 'recovery')}
+            onClick={() =>
+              selectMode(mode === 'recovery' ? 'login' : 'recovery')
+            }
           >
             {mode === 'recovery'
               ? 'Return to sign in'
               : 'Need account recovery?'}
           </button>
-          <button onClick={() => setMode(mode === 'reset' ? 'login' : 'reset')}>
-            {mode === 'reset' ? 'Return to sign in' : 'Have a reset token?'}
+          <button
+            onClick={() => selectMode(mode === 'reset' ? 'login' : 'reset')}
+          >
+            {mode === 'reset' ? 'Return to sign in' : 'Have a setup token?'}
           </button>
         </div>
         <p className="security-note">No public registration is available.</p>
@@ -502,6 +597,9 @@ function PasswordPanel({
   const [confirmPassword, setConfirm] = useState('');
   const [authenticatorCode, setAuthenticatorCode] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
+  const systemAdministrator = session.user.roles.includes(
+    'SYSTEM_ADMINISTRATOR',
+  );
   return (
     <form
       onSubmit={(e) => {
@@ -553,7 +651,7 @@ function PasswordPanel({
         minLength={12}
         required
       />
-      {session.user.mfaEnabled && (
+      {systemAdministrator && session.user.mfaEnabled && (
         <>
           <p className="muted">
             Additional verification is required. Enter one of the following.
@@ -679,6 +777,9 @@ function Account({
   act: (w: () => Promise<void>) => Promise<void>;
   done: () => void;
 }) {
+  const systemAdministrator = session.user.roles.includes(
+    'SYSTEM_ADMINISTRATOR',
+  );
   return (
     <div className="content-grid">
       <Card>
@@ -700,16 +801,22 @@ function Account({
           </div>
           <div>
             <dt>Password expires</dt>
-            <dd>{displayDate(session.passwordExpiresAt)}</dd>
+            <dd>
+              {displayDate(session.passwordExpiresAt, session.businessTimeZone)}
+            </dd>
           </div>
           <div>
             <dt>Session expires</dt>
-            <dd>{displayDate(session.sessionExpiresAt)}</dd>
+            <dd>
+              {displayDate(session.sessionExpiresAt, session.businessTimeZone)}
+            </dd>
           </div>
-          <div>
-            <dt>MFA</dt>
-            <dd>{session.user.mfaEnabled ? 'Enabled' : 'Available'}</dd>
-          </div>
+          {systemAdministrator && (
+            <div>
+              <dt>MFA</dt>
+              <dd>{session.user.mfaEnabled ? 'Enabled' : 'Required'}</dd>
+            </div>
+          )}
         </dl>
       </Card>
       <Card>
@@ -717,14 +824,14 @@ function Account({
         <h2>Change password</h2>
         <PasswordPanel session={session} act={act} done={done} />
       </Card>
-      {!session.user.mfaEnabled && (
+      {systemAdministrator && !session.user.mfaEnabled && (
         <Card>
           <p className="eyebrow">MULTI-FACTOR AUTHENTICATION</p>
           <h2>Authenticator app</h2>
           <MfaPanel session={session} act={act} done={done} />
         </Card>
       )}
-      {session.user.mfaEnabled && (
+      {systemAdministrator && session.user.mfaEnabled && (
         <Card>
           <p className="eyebrow">MULTI-FACTOR AUTHENTICATION</p>
           <h2>Disable authenticator</h2>
@@ -868,8 +975,11 @@ function Users({
     }
   }, []);
   useEffect(() => {
-    void loadUsers();
-    void loadCatalog();
+    const task = window.setTimeout(() => {
+      void loadUsers();
+      void loadCatalog();
+    }, 0);
+    return () => window.clearTimeout(task);
   }, [loadCatalog, loadUsers]);
   const action = (path: string, method = 'POST', body?: object) =>
     act(async () => {
@@ -1000,9 +1110,10 @@ function Users({
         </form>
         {token && (
           <Feedback>
-            <strong>Single-use reset token</strong>
+            <strong>10-digit setup token</strong>
             <code className="token-value">{token}</code>Transfer through an
-            approved out-of-band channel.
+            approved out-of-band channel. It expires after 30 minutes and can be
+            used once.
           </Feedback>
         )}
       </Card>
@@ -1216,7 +1327,6 @@ function Access({
   const [roleDescription, setRoleDescription] = useState('');
   const [roleReason, setRoleReason] = useState('');
   const [rolePermissions, setRolePermissions] = useState<string[]>([]);
-  const [roleMfa, setRoleMfa] = useState(false);
   const [editingRoleId, setEditingRoleId] = useState<string | 'new' | null>(
     null,
   );
@@ -1236,7 +1346,8 @@ function Access({
     }
   }, []);
   useEffect(() => {
-    void load();
+    const task = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(task);
   }, [load]);
   const create = (path: string, body: object) =>
     act(async () => {
@@ -1269,7 +1380,6 @@ function Access({
     setRoleDescription('');
     setRoleReason('');
     setRolePermissions([]);
-    setRoleMfa(false);
   };
   const editRole = (role: Catalog['roles'][number]) => {
     setEditingRoleId(role.id);
@@ -1277,7 +1387,6 @@ function Access({
     setRn(role.name);
     setRoleDescription(role.description ?? '');
     setRolePermissions(role.permissions);
-    setRoleMfa(role.mfaRequired);
     setRoleReason('');
   };
   const saveRole = () =>
@@ -1285,7 +1394,6 @@ function Access({
       const details = {
         name: rn,
         description: roleDescription || undefined,
-        mfaRequired: roleMfa,
         permissions: rolePermissions,
         reason: roleReason,
       };
@@ -1467,14 +1575,6 @@ function Access({
               value={roleDescription}
               onChange={(e) => setRoleDescription(e.target.value)}
             />
-            <label>
-              <input
-                type="checkbox"
-                checked={roleMfa}
-                onChange={(e) => setRoleMfa(e.target.checked)}
-              />{' '}
-              Require MFA
-            </label>
             <fieldset className="access-rights-editor">
               <legend>Access rights</legend>
               <p className="muted">
@@ -1656,7 +1756,7 @@ function Events({ session }: { session: Session }) {
         >
           {events.map((e) => (
             <tr key={e.id}>
-              <td>{displayDate(e.createdAt)}</td>
+              <td>{displayDate(e.createdAt, session.businessTimeZone)}</td>
               <td className="audit-user">
                 {e.actorName ?? 'System'}
                 <small>{e.actorUserId ?? 'System event'}</small>

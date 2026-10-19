@@ -26,6 +26,8 @@ import {
   encryptSecret,
   hashPassword,
   passwordPolicyErrors,
+  randomNumericToken,
+  randomToken,
   tokenHash,
   totp,
   verifyPassword,
@@ -37,7 +39,9 @@ import { SafeLogger } from '../src/common/safe-logger.js';
 import { setup } from '../src/setup.js';
 import { DatabaseService } from '../src/database/database.service.js';
 import { UpdateUserDto } from '../src/admin/admin.dto.js';
+import { ResetPasswordDto } from '../src/auth/auth.dto.js';
 import { validate } from 'class-validator';
+import { UnauthorizedException } from '@nestjs/common';
 
 const key = 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=';
 const config = new ConfigService<Environment, true>({
@@ -113,15 +117,28 @@ class FakeRepository {
   async passwordHistory() {
     return this.history;
   }
-  async changePassword(_u: AuthUser, hash: string, expires: Date) {
+  async changePassword(account: AuthUser, hash: string, expires: Date) {
     this.changed = { hash, expires };
+    account.passwordHash = hash;
+    account.passwordExpiresAt = expires;
+    account.mustChangePassword = false;
   }
   async findResetUser() {
     return this.resetAvailable ? this.account : null;
   }
-  async consumeReset() {
+  async consumeReset(
+    _username: string,
+    _tokenHashValue: string,
+    passwordHash: string,
+    expiresAt: Date,
+  ) {
     if (!this.resetAvailable) return null;
     this.resetAvailable = false;
+    if (this.account) {
+      this.account.passwordHash = passwordHash;
+      this.account.passwordExpiresAt = expiresAt;
+      this.account.mustChangePassword = false;
+    }
     return this.account?.id ?? null;
   }
   async consumeRecoveryCode() {
@@ -142,6 +159,74 @@ class FakeRepository {
   }
   async bootstrap() {
     return this.account?.id ?? null;
+  }
+}
+
+class ResetFlowRepository {
+  tokenHashValue: string | null = null;
+  tokenExpiresAt: Date | null = null;
+  tokenUsed = false;
+  events: SecurityEvent[] = [];
+  createdSession = false;
+
+  constructor(public account: AuthUser) {}
+
+  async findUserById(id: string) {
+    return id === this.account.id ? this.account : null;
+  }
+  async findUserByUsername(username: string) {
+    return username === this.account.username ? this.account : null;
+  }
+  async issueReset(
+    _userId: string,
+    tokenHashValue: string,
+    _createdBy: string,
+    expiresAt: Date,
+  ) {
+    this.tokenHashValue = tokenHashValue;
+    this.tokenExpiresAt = expiresAt;
+    this.tokenUsed = false;
+    return 'isolated-reset-id';
+  }
+  async findResetUser(username: string, tokenHashValue: string) {
+    return username.toLowerCase() === this.account.username.toLowerCase() &&
+      tokenHashValue === this.tokenHashValue &&
+      !this.tokenUsed &&
+      Boolean(this.tokenExpiresAt && this.tokenExpiresAt > new Date())
+      ? this.account
+      : null;
+  }
+  async consumeReset(
+    username: string,
+    tokenHashValue: string,
+    passwordHash: string,
+    expiresAt: Date,
+  ) {
+    if (!(await this.findResetUser(username, tokenHashValue))) return null;
+    this.tokenUsed = true;
+    this.account = {
+      ...this.account,
+      passwordHash,
+      passwordExpiresAt: expiresAt,
+      mustChangePassword: false,
+      authVersion: this.account.authVersion + 1,
+    };
+    return this.account.id;
+  }
+  async passwordHistory() {
+    return [];
+  }
+  async event(value: SecurityEvent) {
+    this.events.push(value);
+  }
+  async recordFailedLogin() {}
+  async clearFailedLogins() {}
+  async createSession() {
+    this.createdSession = true;
+    return 'isolated-new-user-session';
+  }
+  async consumeRecoveryCode() {
+    return false;
   }
 }
 function service(repository: FakeRepository) {
@@ -173,6 +258,169 @@ describe('password and MFA primitives', () => {
     const now = 1_800_000_000_000;
     assert.equal(verifyTotp(secret, totp(secret, now), now), true);
     assert.equal(verifyTotp(secret, '000000', now), false);
+  });
+  it('generates exactly ten unbiased numeric setup-token digits and preserves leading zeroes', () => {
+    for (let index = 0; index < 100; index += 1)
+      assert.match(randomNumericToken(), /^\d{10}$/);
+    assert.equal(
+      randomNumericToken(10, (size) => Buffer.alloc(size, 0)),
+      '0000000000',
+    );
+  });
+  it('accepts ten-digit setup tokens and unexpired legacy token formats at validation', async () => {
+    const numeric = Object.assign(new ResetPasswordDto(), {
+      username: 'monitor.one',
+      token: '0123456789',
+      newPassword: 'Harbor-Stone-84!',
+    });
+    const legacy = Object.assign(new ResetPasswordDto(), {
+      username: 'monitor.one',
+      token: randomToken(),
+      newPassword: 'Harbor-Stone-84!',
+    });
+
+    assert.equal((await validate(numeric)).length, 0);
+    assert.equal((await validate(legacy)).length, 0);
+  });
+});
+
+describe('public login guard regression', () => {
+  it('reaches login logic without a session while protected routes still require one', async () => {
+    const login = mock.fn(async () => {
+      throw new UnauthorizedException('Invalid credentials.');
+    });
+    const authenticate = mock.fn(async () => null);
+    const auth = {
+      login,
+      authenticate,
+      verifyCsrf: mock.fn(() => false),
+    };
+    const guardConfig = new ConfigService<Environment, true>({
+      NODE_ENV: 'test',
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+      SESSION_ABSOLUTE_HOURS: 8,
+      BOOTSTRAP_TOKEN: 'isolated-bootstrap-token-with-32-characters',
+      BUSINESS_TIME_ZONE: 'Asia/Kolkata',
+    } as Environment);
+    const module = await Test.createTestingModule({
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthRepository, useValue: {} },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+    try {
+      await app.init();
+      const invalid = await request(app.getHttpServer())
+        .post('/api/v1/auth/login')
+        .set('Origin', 'http://localhost:3000')
+        .send({ username: 'unknown.user', password: 'invalid-password' })
+        .expect(401);
+      assert.equal(invalid.body.code, 'AUTHENTICATION_REQUIRED');
+      assert.equal(invalid.body.message, 'Authentication is required.');
+      assert.equal(login.mock.callCount(), 1);
+      assert.equal(authenticate.mock.callCount(), 0);
+
+      const protectedResponse = await request(app.getHttpServer())
+        .get('/api/v1/auth/session')
+        .expect(401);
+      assert.equal(protectedResponse.body.code, 'AUTHENTICATION_REQUIRED');
+      assert.equal(login.mock.callCount(), 1);
+      assert.equal(authenticate.mock.callCount(), 1);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('first-administrator bootstrap token regression', () => {
+  it('keeps bootstrap public while rejecting a mismatched token before account creation', async () => {
+    const bootstrap = mock.fn(async () => {
+      throw new Error('bootstrap must not be called by this test');
+    });
+    const repository = {
+      userCount: mock.fn(async () => 0),
+      bootstrap,
+      event: mock.fn(async () => undefined),
+    };
+    const expectedToken = 'isolated-bootstrap-token-with-32-characters';
+    const guardConfig = new ConfigService<Environment, true>({
+      NODE_ENV: 'test',
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+      SESSION_ABSOLUTE_HOURS: 8,
+      SESSION_IDLE_MINUTES: 30,
+      PASSWORD_EXPIRY_DAYS: 30,
+      PASSWORD_HISTORY_COUNT: 5,
+      LOGIN_MAX_FAILURES: 5,
+      LOCKOUT_MINUTES: 15,
+      RESET_TOKEN_MINUTES: 30,
+      MFA_ENCRYPTION_KEY: key,
+      BOOTSTRAP_TOKEN: expectedToken,
+      BUSINESS_TIME_ZONE: 'Asia/Kolkata',
+    } as Environment);
+    const auth = new AuthService(
+      repository as unknown as AuthRepository,
+      guardConfig,
+    );
+    const module = await Test.createTestingModule({
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthRepository, useValue: repository },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: guardConfig },
+        AuthorizationService,
+        { provide: APP_GUARD, useClass: AuthenticationGuard },
+        { provide: APP_GUARD, useClass: PermissionGuard },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+    const body = {
+      username: 'bootstrap.probe',
+      fullName: 'Bootstrap Probe',
+      password: '!!!!!!!!!!!!',
+    };
+    try {
+      await app.init();
+      const mismatched = await request(app.getHttpServer())
+        .post('/api/v1/auth/bootstrap')
+        .set(
+          'X-Bootstrap-Token',
+          'different-bootstrap-token-with-32-characters',
+        )
+        .send(body)
+        .expect(401);
+      assert.equal(mismatched.body.code, 'AUTHENTICATION_REQUIRED');
+      assert.equal(bootstrap.mock.callCount(), 0);
+
+      const matching = await request(app.getHttpServer())
+        .post('/api/v1/auth/bootstrap')
+        .set('X-Bootstrap-Token', expectedToken)
+        .send(body)
+        .expect(400);
+      assert.equal(matching.body.code, 'INVALID_REQUEST');
+      assert.equal(
+        matching.body.message,
+        'Password must contain letters and numbers.',
+      );
+      assert.equal(bootstrap.mock.callCount(), 0);
+    } finally {
+      await app.close();
+    }
   });
 });
 
@@ -292,12 +540,14 @@ describe('authentication lifecycle', () => {
       username: 'revoked.monitor',
       roles: ['CRA_MONITOR'],
       permissions: ['View', 'Edit', 'Comment', 'Respond'],
+      mfaRequired: true,
     });
     const administrator = user({
       id: '00000000-0000-4000-8000-000000000012',
       username: 'system.administrator',
       roles: ['SYSTEM_ADMINISTRATOR'],
       permissions: ['View', 'Administer', 'AuditReview'],
+      mfaEnabled: true,
     });
     const originalCookie = 'isolated-original-cra-cookie';
     const freshCookie = 'isolated-fresh-cra-cookie';
@@ -408,6 +658,8 @@ describe('authentication lifecycle', () => {
         .set('Cookie', `zenovel_session=${originalCookie}`)
         .expect(200);
       assert.equal(beforeRevocation.body.user.username, cra.username);
+      assert.equal(beforeRevocation.body.user.mfaRequired, false);
+      assert.equal(beforeRevocation.body.mfaEnrollmentRequired, false);
 
       await request(app.getHttpServer())
         .post(`/api/v1/admin/users/${cra.id}/revoke-sessions`)
@@ -472,13 +724,44 @@ describe('authentication lifecycle', () => {
     const days = (repo.changed!.expires.getTime() - before) / 86_400_000;
     assert.ok(days >= 29.99 && days <= 30.01);
   });
+  it('allows a standard user with legacy MFA state to use password-only login and password change', async () => {
+    const repo = new FakeRepository();
+    repo.account = user({
+      passwordHash: await hashPassword('Cedar-River-42!'),
+      mfaEnabled: true,
+      mfaRequired: true,
+      mfaSecretEncrypted: encryptSecret('JBSWY3DPEHPK3PXP', key),
+    });
+    const auth = service(repo);
+
+    await auth.login({
+      username: repo.account.username,
+      password: 'Cedar-River-42!',
+    });
+    await auth.changePassword(
+      repo.account,
+      'Cedar-River-42!',
+      'Harbor-Stone-84!',
+    );
+    await auth.login({
+      username: repo.account.username,
+      password: 'Harbor-Stone-84!',
+    });
+
+    assert.ok(repo.createdSession);
+    assert.ok(repo.changed);
+    assert.equal(repo.recoveryValid, false);
+  });
   it('distinguishes current-password and MFA step-up failures during password change', async () => {
     const repo = new FakeRepository();
     const secret = 'JBSWY3DPEHPK3PXP';
     repo.account = user({
       passwordHash: await hashPassword('Cedar-River-42!'),
       mfaEnabled: true,
+      mfaRequired: true,
       mfaSecretEncrypted: encryptSecret(secret, key),
+      roles: ['SYSTEM_ADMINISTRATOR'],
+      permissions: ['Administer'],
     });
     const auth = service(repo);
     await assert.rejects(
@@ -512,7 +795,7 @@ describe('authentication lifecycle', () => {
     );
     assert.ok(repo.changed);
   });
-  it('enforces reset-token single use and first-login forced change', async () => {
+  it('enforces reset-token single use without a redundant password-change gate', async () => {
     const repo = new FakeRepository();
     repo.account = user({
       passwordHash: await hashPassword('Cedar-River-42!'),
@@ -525,43 +808,332 @@ describe('authentication lifecycle', () => {
     });
     assert.equal(login.session.user.mustChangePassword, true);
     await auth.completeReset(
+      'monitor.one',
       'long-enough-single-use-reset-token',
       'Harbor-Stone-84!',
     );
     await assert.rejects(
       () =>
         auth.completeReset(
+          'monitor.one',
           'long-enough-single-use-reset-token',
           'Ocean-Field-95!',
         ),
-      /invalid or expired/,
+      /invalid, expired/,
     );
   });
-  it('accepts a recovery code once and supports re-authenticated optional MFA disable', async () => {
+  it('completes administrator-token onboarding through the HTTP endpoint with safe failures', async () => {
+    const account = user({
+      id: '00000000-0000-4000-8000-000000000091',
+      username: 'new.monitor',
+      passwordHash: await hashPassword('Initial-Harbor-73!'),
+      mustChangePassword: true,
+    });
+    const repository = new ResetFlowRepository(account);
+    const resetConfig = new ConfigService<Environment, true>({
+      NODE_ENV: 'test',
+      CORS_ORIGINS: ['http://localhost:3000'],
+      SESSION_COOKIE_NAME: 'zenovel_session',
+      SESSION_ABSOLUTE_HOURS: 8,
+      SESSION_IDLE_MINUTES: 30,
+      PASSWORD_EXPIRY_DAYS: 30,
+      PASSWORD_HISTORY_COUNT: 5,
+      LOGIN_MAX_FAILURES: 5,
+      LOCKOUT_MINUTES: 15,
+      RESET_TOKEN_MINUTES: 30,
+      MFA_ENCRYPTION_KEY: key,
+      BOOTSTRAP_TOKEN: 'isolated-bootstrap-token-with-32-characters',
+    } as Environment);
+    const auth = new AuthService(
+      repository as unknown as AuthRepository,
+      resetConfig,
+    );
+    const module = await Test.createTestingModule({
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthRepository, useValue: repository },
+        { provide: AuthService, useValue: auth },
+        { provide: ConfigService, useValue: resetConfig },
+      ],
+    }).compile();
+    const app = module.createNestApplication<NestExpressApplication>({
+      logger: false,
+      bodyParser: false,
+    });
+    setup(app, new SafeLogger());
+
+    try {
+      await app.init();
+      const issuedAt = Date.now();
+      const issuedToken = await auth.issueReset(
+        '00000000-0000-4000-8000-000000000092',
+        account.id,
+      );
+      assert.equal(repository.tokenHashValue, tokenHash(issuedToken));
+      assert.notEqual(repository.tokenHashValue, issuedToken);
+      assert.match(issuedToken, /^\d{10}$/);
+      assert.ok(repository.tokenExpiresAt);
+      const expiryMinutes =
+        (repository.tokenExpiresAt!.getTime() - issuedAt) / 60_000;
+      assert.ok(expiryMinutes >= 29.99 && expiryMinutes <= 30.01);
+
+      const completed = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: issuedToken,
+          newPassword: 'Harbor-Stone-84!',
+        })
+        .expect(201);
+      assert.deepEqual(completed.body, {
+        success: true,
+        loginRequired: true,
+      });
+      assert.equal(repository.tokenUsed, true);
+      assert.equal(
+        await verifyPassword(
+          'Harbor-Stone-84!',
+          repository.account.passwordHash,
+        ),
+        true,
+      );
+
+      const login = await request(app.getHttpServer())
+        .post('/api/v1/auth/login')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: repository.account.username,
+          password: 'Harbor-Stone-84!',
+        })
+        .expect(201);
+      assert.equal(login.body.passwordExpired, false);
+      assert.equal(repository.createdSession, true);
+
+      const reused = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: issuedToken,
+          newPassword: 'Ocean-Field-95!',
+        })
+        .expect(400);
+      assert.equal(reused.body.code, 'INVALID_REQUEST');
+      assert.equal(
+        reused.body.message,
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+      assert.doesNotMatch(JSON.stringify(reused.body), new RegExp(issuedToken));
+
+      const invalidToken = randomToken();
+      const invalid = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: invalidToken,
+          newPassword: 'Ocean-Field-95!',
+        })
+        .expect(400);
+      assert.equal(
+        invalid.body.message,
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+      assert.doesNotMatch(
+        JSON.stringify(invalid.body),
+        new RegExp(invalidToken),
+      );
+
+      const policyToken = await auth.issueReset(
+        '00000000-0000-4000-8000-000000000092',
+        account.id,
+      );
+      const policyFailure = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: policyToken,
+          newPassword: 'OnlyLettersHere!',
+        })
+        .expect(400);
+      assert.equal(
+        policyFailure.body.message,
+        'Password must contain letters and numbers.',
+      );
+      assert.equal(repository.tokenUsed, false);
+
+      const mismatch = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: 'unrelated.user',
+          token: policyToken,
+          newPassword: 'Ocean-Field-95!',
+        })
+        .expect(400);
+      assert.equal(
+        mismatch.body.message,
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+      assert.equal(repository.tokenUsed, false);
+
+      const expiredToken = await auth.issueReset(
+        '00000000-0000-4000-8000-000000000092',
+        account.id,
+      );
+      repository.tokenExpiresAt = new Date(Date.now() - 1);
+      const expired = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: expiredToken,
+          newPassword: 'Ocean-Field-95!',
+        })
+        .expect(400);
+      assert.equal(
+        expired.body.message,
+        'User ID or setup token is invalid, expired, or already used.',
+      );
+
+      const malformed = await request(app.getHttpServer())
+        .post('/api/v1/auth/reset')
+        .set('Origin', 'http://localhost:3000')
+        .send({
+          username: account.username,
+          token: 'short',
+          newPassword: 'short',
+        })
+        .expect(400);
+      assert.equal(malformed.body.code, 'INVALID_REQUEST');
+      assert.match(
+        malformed.body.message,
+        /Setup token must contain exactly 10 digits|New password must be at least 12 characters/,
+      );
+      assert.doesNotMatch(
+        JSON.stringify(malformed.body),
+        /short|stack|passwordHash/,
+      );
+    } finally {
+      await app.close();
+    }
+  });
+  it('temporarily throttles failed setup-token guesses by User ID and source IP', async () => {
+    const repository = new ResetFlowRepository(
+      user({
+        username: 'rate.limited',
+        passwordHash: await hashPassword('Initial-Harbor-73!'),
+      }),
+    );
+    const auth = new AuthService(
+      repository as unknown as AuthRepository,
+      config,
+    );
+    for (let attempt = 0; attempt < 5; attempt += 1)
+      await assert.rejects(
+        () =>
+          auth.completeReset(
+            'rate.limited',
+            '0000000000',
+            'Harbor-Stone-84!',
+            '192.0.2.20',
+          ),
+        /invalid, expired, or already used/,
+      );
+
+    await assert.rejects(
+      () =>
+        auth.completeReset(
+          'rate.limited',
+          '0000000000',
+          'Harbor-Stone-84!',
+          '192.0.2.20',
+        ),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'getStatus' in error &&
+        typeof error.getStatus === 'function' &&
+        error.getStatus() === 429,
+    );
+    await assert.rejects(
+      () =>
+        auth.completeReset(
+          'rate.limited',
+          '0000000000',
+          'Harbor-Stone-84!',
+          '192.0.2.21',
+        ),
+      /invalid, expired, or already used/,
+    );
+  });
+  it('requires System Administrator MFA and accepts its recovery code once', async () => {
     const repo = new FakeRepository();
     repo.recoveryValid = true;
     repo.account = user({
       passwordHash: await hashPassword('Cedar-River-42!'),
       mfaEnabled: true,
+      mfaRequired: true,
       mfaSecretEncrypted: encryptSecret('JBSWY3DPEHPK3PXP', key),
+      roles: ['SYSTEM_ADMINISTRATOR'],
+      permissions: ['Administer'],
     });
     const auth = service(repo);
+    await assert.rejects(
+      () =>
+        auth.login({
+          username: 'monitor.one',
+          password: 'Cedar-River-42!',
+        }),
+      /System Administrator authenticator code or one-time recovery code/,
+    );
     await auth.login({
       username: 'monitor.one',
       password: 'Cedar-River-42!',
       mfaCode: 'ABCD-EFGH',
     });
     assert.equal(repo.recoveryValid, false);
-    repo.recoveryValid = true;
-    await auth.disableMfa(
-      repo.account,
-      'Cedar-River-42!',
-      undefined,
-      'ABCD-EFGH',
-      'Owner requested MFA disable.',
+    await assert.rejects(
+      () =>
+        auth.login({
+          username: 'monitor.one',
+          password: 'Cedar-River-42!',
+          mfaCode: 'ABCD-EFGH',
+        }),
+      /MFA verification failed/,
     );
-    assert.equal(repo.mfaDisabled, true);
-    assert.equal(repo.events.at(-1)?.eventType, 'mfa_disabled');
+  });
+  it('denies MFA enrollment and recovery workflows to ordinary users', async () => {
+    const repo = new FakeRepository();
+    repo.account = user({
+      passwordHash: await hashPassword('Cedar-River-42!'),
+      mfaEnabled: true,
+      mfaSecretEncrypted: encryptSecret('JBSWY3DPEHPK3PXP', key),
+    });
+    const auth = service(repo);
+
+    await assert.rejects(
+      () => auth.beginMfa(repo.account!, 'Cedar-River-42!'),
+      /only to the System Administrator/,
+    );
+    await assert.rejects(
+      () => auth.confirmMfa(repo.account!.id, totp('JBSWY3DPEHPK3PXP')),
+      /only to the System Administrator/,
+    );
+    await assert.rejects(
+      () =>
+        auth.disableMfa(
+          repo.account!,
+          'Cedar-River-42!',
+          undefined,
+          'ABCD-EFGH',
+          'Attempt ordinary MFA change.',
+        ),
+      /only to the System Administrator/,
+    );
+    assert.equal(repo.mfaDisabled, false);
   });
 });
 
@@ -766,6 +1338,17 @@ describe('role-management safeguards', () => {
         }),
       /Administrator access is restricted/,
     );
+    await assert.rejects(
+      () =>
+        admin.createRole(actorId, {
+          code: 'CUSTOM_MFA',
+          name: 'Custom MFA role',
+          mfaRequired: true,
+          permissions: ['View'],
+          reason: 'Attempt role-level MFA requirement.',
+        }),
+      /only for the protected System Administrator role/,
+    );
     assert.equal(database.transaction.mock.callCount(), 0);
     await assert.rejects(
       () =>
@@ -794,6 +1377,12 @@ describe('Stage 2 interface refinements', () => {
     );
     assert.match(source, /Authenticator code/);
     assert.match(source, /One-time recovery code/);
+    assert.match(source, /mode === 'login' && administratorMfaRequested &&/);
+    assert.match(source, /systemAdministrator && session\.user\.mfaEnabled/);
+    assert.doesNotMatch(source, /mode === 'login' && \(\s*<>\s*<Field/);
+    assert.match(source, /Confirm new password/);
+    assert.match(source, /token: token\.trim\(\)/);
+    assert.match(source, /Password set successfully/);
     assert.match(source, /Apply filters/);
     assert.match(source, /Clear filters/);
     assert.doesNotMatch(source, /Security events/);

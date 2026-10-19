@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ValidationPipe } from '@nestjs/common';
+import { BadRequestException, ValidationPipe } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { ConfigService } from '@nestjs/config';
 import helmet from 'helmet';
@@ -60,7 +60,14 @@ export function setup(app: NestExpressApplication, logger: SafeLogger) {
       forbidNonWhitelisted: true,
       transform: true,
       validationError: { target: false, value: false },
+      exceptionFactory: (errors) =>
+        new BadRequestException({
+          message: errors.flatMap((error) =>
+            Object.values(error.constraints ?? {}),
+          ),
+          fields: errors.map((error) => error.property),
+        }),
     }),
   );
-  app.useGlobalFilters(new ErrorFilter());
+  app.useGlobalFilters(new ErrorFilter(logger));
 }

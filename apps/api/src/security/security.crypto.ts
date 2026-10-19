@@ -37,6 +37,20 @@ export function randomToken(bytes = 32): string {
   return randomBytes(bytes).toString('base64url');
 }
 
+export function randomNumericToken(
+  digits = 10,
+  source: (size: number) => Buffer = randomBytes,
+): string {
+  let value = '';
+  while (value.length < digits) {
+    for (const byte of source(digits - value.length)) {
+      if (byte < 250) value += String(byte % 10);
+      if (value.length === digits) break;
+    }
+  }
+  return value;
+}
+
 export function tokenHash(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }

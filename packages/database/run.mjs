@@ -72,19 +72,30 @@ try {
       '1780000000000-initialize-schema',
       '1790000000000-auth-access-control',
       '1800000000000-stage-2-audit-role-refinement',
+      '1810000000000-stage-3-project-tracking',
     ];
     const expectedTables = [
       'departments',
       'mfa_recovery_codes',
+      'notifications',
       'password_history',
       'password_reset_tokens',
       'permissions',
+      'project_assignments',
+      'project_milestone_corrections',
+      'project_milestones',
+      'project_ownership_transfers',
+      'project_status_history',
+      'project_timeline_overrides',
+      'project_visits',
+      'projects',
       'role_permissions',
       'roles',
       'security_events',
       'sessions',
       'user_roles',
       'users',
+      'working_calendar_days',
     ];
     if (
       !schema.rows[0]?.present ||
@@ -95,8 +106,8 @@ try {
         .sort()
         .join('|') !== expectedTables.join('|')
     )
-      throw new Error('Unexpected Stage 2 schema');
-    console.log('Stage 2 authentication schema and migration history PASS.');
+      throw new Error('Unexpected Stage 3 schema');
+    console.log('Stage 3 project-tracking schema and migration history PASS.');
   }
 } catch {
   console.error(
