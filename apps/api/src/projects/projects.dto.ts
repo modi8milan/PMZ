@@ -35,16 +35,7 @@ export class CreateProjectDto {
   @MinLength(2)
   @MaxLength(100)
   sponsorProjectId!: string;
-  @Transform(clean)
-  @IsString()
-  @MinLength(2)
-  @MaxLength(200)
-  sponsorName!: string;
-  @Transform(clean)
-  @IsString()
-  @MinLength(2)
-  @MaxLength(80)
-  clientCode!: string;
+  @IsUUID() clientId!: string;
   @Transform(clean) @IsString() @MinLength(2) @MaxLength(300) title!: string;
   @Transform(clean)
   @IsOptional()
@@ -139,11 +130,7 @@ export class TransferProjectDto {
 }
 
 export class CreateVisitDto {
-  @Transform(clean)
-  @IsString()
-  @MinLength(2)
-  @MaxLength(120)
-  visitType!: string;
+  @IsUUID() visitTypeId!: string;
   @IsOptional() @IsUUID() monitorUserId?: string;
   @IsOptional()
   @IsIn(VISIT_STATUSES)
@@ -160,6 +147,7 @@ export class CreateVisitDto {
   @IsString()
   @MaxLength(2000)
   reportFromMonitor?: string;
+  @IsOptional() @Matches(DATE) visitStartDate?: string;
   @IsOptional() @Matches(DATE) visitEndDate?: string;
   @Transform(clean)
   @IsOptional()
@@ -198,6 +186,63 @@ export class CreateVisitDto {
   @MaxLength(2000)
   comments?: string;
   @IsOptional() @Matches(DATE) finalArchivalDate?: string;
+}
+
+export class UpdateVisitDatesDto {
+  @IsOptional() @Matches(DATE) visitStartDate?: string;
+  @IsOptional() @Matches(DATE) visitEndDate?: string;
+  @Transform(clean) @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
+export class UpdateVisitAssignmentDto {
+  @IsOptional() @IsUUID() monitorUserId?: string | null;
+  @Transform(clean) @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
+export class MonitorAvailabilityQueryDto {
+  @IsUUID() monitorUserId!: string;
+  @Matches(DATE) visitStartDate!: string;
+  @Matches(DATE) visitEndDate!: string;
+  @IsOptional() @IsUUID() excludeVisitId?: string;
+}
+
+export class CreateVisitTypeDto {
+  @Transform(clean)
+  @IsString()
+  @MinLength(2)
+  @MaxLength(120)
+  displayName!: string;
+}
+
+export class UpdateVisitTypeDto {
+  @Transform(clean)
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(120)
+  displayName?: string;
+  @IsOptional() @IsBoolean() active?: boolean;
+}
+
+export class CreateClientDto {
+  @Transform(clean) @IsString() @MinLength(2) @MaxLength(200) name!: string;
+  @Transform(clean) @IsString() @MinLength(2) @MaxLength(80) code!: string;
+}
+
+export class UpdateClientDto {
+  @Transform(clean)
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(200)
+  name?: string;
+  @Transform(clean)
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(80)
+  code?: string;
+  @IsOptional() @IsBoolean() active?: boolean;
 }
 
 export class TimelineOverrideDto {

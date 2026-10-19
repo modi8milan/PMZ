@@ -23,6 +23,7 @@ import type {
   UpdateDepartmentDto,
   UpdateRoleDto,
   UpdateUserDto,
+  ProcessResetRequestDto,
 } from './admin.dto.js';
 
 @Injectable()
@@ -79,6 +80,15 @@ export class AdminService {
       GROUP BY u.id,d.name ORDER BY u.full_name`);
     return result.rows;
   }
+  async resetRequests() {
+    const result = await this.db.query(
+      `SELECT r.id,r.status,r.requested_at AS "requestedAt",r.reviewed_at AS "reviewedAt",
+       r.review_reason AS "reviewReason",u.id AS "userId",u.username,u.full_name AS "fullName",u.email
+       FROM zenovel.password_reset_requests r JOIN zenovel.users u ON u.id=r.user_id
+       ORDER BY CASE WHEN r.status='PENDING' THEN 0 ELSE 1 END,r.requested_at DESC LIMIT 200`,
+    );
+    return result.rows;
+  }
   async createUser(actorId: string, input: CreateUserDto, requestId?: string) {
     const id = randomUUID();
     const unusablePassword = await hashPassword(randomToken(48));
@@ -97,7 +107,7 @@ export class AdminService {
             id,
             input.username,
             input.fullName,
-            input.email ?? null,
+            input.email.trim().toLowerCase(),
             input.departmentId ?? null,
             unusablePassword,
           ],
@@ -111,6 +121,14 @@ export class AdminService {
       });
     } catch (error) {
       if (error instanceof BadRequestException) throw error;
+      const value = error as { code?: string; constraint?: string };
+      if (
+        value.code === '23505' &&
+        value.constraint?.includes('users_email_normalized')
+      )
+        throw new ConflictException(
+          'This email address is already assigned to another account.',
+        );
       throw new ConflictException();
     }
     const reason = this.requiredReason(input.reason);
@@ -170,76 +188,91 @@ export class AdminService {
         );
     }
     let roleChange: { beforeRoles: string; afterRoles: string } | undefined;
-    await this.db.transaction(async (client) => {
-      await client.query(
-        `UPDATE zenovel.users SET full_name=COALESCE($2,full_name),email=COALESCE($3,email),
+    try {
+      await this.db.transaction(async (client) => {
+        await client.query(
+          `UPDATE zenovel.users SET full_name=COALESCE($2,full_name),email=COALESCE(lower(btrim($3)),email),
         department_id=COALESCE($4,department_id),status=COALESCE($5,status),
         deactivated_at=CASE WHEN $5='inactive' THEN now() WHEN $5='active' THEN NULL ELSE deactivated_at END,
         auth_version=CASE WHEN $5 IS NOT NULL OR $6::boolean THEN auth_version+1 ELSE auth_version END,updated_at=now() WHERE id=$1`,
-        [
-          userId,
-          input.fullName ?? null,
-          input.email ?? null,
-          input.departmentId ?? null,
-          input.status ?? null,
-          input.roleIds !== undefined,
-        ],
-      );
-      if (input.roleIds) {
-        const validRoles = await client.query<{ id: string; code: string }>(
-          'SELECT id,code FROM zenovel.roles WHERE id=ANY($1::uuid[]) AND active=true',
-          [input.roleIds],
+          [
+            userId,
+            input.fullName ?? null,
+            input.email?.trim().toLowerCase() ?? null,
+            input.departmentId ?? null,
+            input.status ?? null,
+            input.roleIds !== undefined,
+          ],
         );
-        if (validRoles.rows.length !== input.roleIds.length)
-          throw new BadRequestException('One or more roles are unavailable.');
-        if (
-          validRoles.rows.some(
-            (role) => role.code === 'SYSTEM_ADMINISTRATOR',
-          ) &&
-          !actor?.roles.includes('SYSTEM_ADMINISTRATOR')
-        )
-          throw new ForbiddenException(
-            'Only a system administrator can assign that role.',
+        if (input.roleIds) {
+          const validRoles = await client.query<{ id: string; code: string }>(
+            'SELECT id,code FROM zenovel.roles WHERE id=ANY($1::uuid[]) AND active=true',
+            [input.roleIds],
           );
-        if (
-          current.roles.includes('SYSTEM_ADMINISTRATOR') &&
-          !validRoles.rows.some((role) => role.code === 'SYSTEM_ADMINISTRATOR')
-        ) {
-          const remaining = await client.query<{ count: string }>(
-            `SELECT count(DISTINCT u.id)::text AS count FROM zenovel.users u
+          if (validRoles.rows.length !== input.roleIds.length)
+            throw new BadRequestException('One or more roles are unavailable.');
+          if (
+            validRoles.rows.some(
+              (role) => role.code === 'SYSTEM_ADMINISTRATOR',
+            ) &&
+            !actor?.roles.includes('SYSTEM_ADMINISTRATOR')
+          )
+            throw new ForbiddenException(
+              'Only a system administrator can assign that role.',
+            );
+          if (
+            current.roles.includes('SYSTEM_ADMINISTRATOR') &&
+            !validRoles.rows.some(
+              (role) => role.code === 'SYSTEM_ADMINISTRATOR',
+            )
+          ) {
+            const remaining = await client.query<{ count: string }>(
+              `SELECT count(DISTINCT u.id)::text AS count FROM zenovel.users u
              JOIN zenovel.user_roles ur ON ur.user_id=u.id JOIN zenovel.roles r ON r.id=ur.role_id
              WHERE u.status='active' AND r.code='SYSTEM_ADMINISTRATOR' AND u.id<>$1`,
+              [userId],
+            );
+            if (Number(remaining.rows[0]?.count ?? 0) === 0)
+              throw new BadRequestException(
+                'The last active system administrator cannot lose that role.',
+              );
+          }
+          roleChange = {
+            beforeRoles: [...current.roles].sort().join(','),
+            afterRoles: validRoles.rows
+              .map((role) => role.code)
+              .sort()
+              .join(','),
+          };
+          await client.query(
+            'DELETE FROM zenovel.user_roles WHERE user_id=$1',
             [userId],
           );
-          if (Number(remaining.rows[0]?.count ?? 0) === 0)
-            throw new BadRequestException(
-              'The last active system administrator cannot lose that role.',
+          for (const roleId of input.roleIds)
+            await client.query(
+              `INSERT INTO zenovel.user_roles(user_id,role_id,assigned_by)
+          SELECT $1,id,$3 FROM zenovel.roles WHERE id=$2 AND active=true`,
+              [userId, roleId, actorId],
             );
         }
-        roleChange = {
-          beforeRoles: [...current.roles].sort().join(','),
-          afterRoles: validRoles.rows
-            .map((role) => role.code)
-            .sort()
-            .join(','),
-        };
-        await client.query('DELETE FROM zenovel.user_roles WHERE user_id=$1', [
-          userId,
-        ]);
-        for (const roleId of input.roleIds)
+        if (input.status !== undefined || input.roleIds !== undefined)
           await client.query(
-            `INSERT INTO zenovel.user_roles(user_id,role_id,assigned_by)
-          SELECT $1,id,$3 FROM zenovel.roles WHERE id=$2 AND active=true`,
-            [userId, roleId, actorId],
-          );
-      }
-      if (input.status !== undefined || input.roleIds !== undefined)
-        await client.query(
-          `UPDATE zenovel.sessions SET revoked_at=COALESCE(revoked_at,now()),
+            `UPDATE zenovel.sessions SET revoked_at=COALESCE(revoked_at,now()),
         revoked_reason=CASE WHEN $2='inactive' THEN 'account_deactivated' ELSE 'privileges_changed' END WHERE user_id=$1`,
-          [userId, input.status ?? null],
+            [userId, input.status ?? null],
+          );
+      });
+    } catch (error) {
+      const value = error as { code?: string; constraint?: string };
+      if (
+        value.code === '23505' &&
+        value.constraint?.includes('users_email_normalized')
+      )
+        throw new ConflictException(
+          'This email address is already assigned to another account.',
         );
-    });
+      throw error;
+    }
     const eventType =
       input.status === 'inactive'
         ? 'user_deactivated'
@@ -255,7 +288,16 @@ export class AdminService {
       outcome: 'success',
       requestId,
       reason,
-      context: roleChange,
+      context: {
+        ...roleChange,
+        ...(input.email !== undefined
+          ? {
+              emailChanged:
+                input.email.trim().toLowerCase() !==
+                current.email?.trim().toLowerCase(),
+            }
+          : {}),
+      },
     });
     return { success: true };
   }
@@ -296,6 +338,75 @@ export class AdminService {
       ),
       delivery:
         'Provide this 10-digit, single-use setup token through an approved out-of-band channel.',
+    };
+  }
+  async processResetRequest(
+    actorId: string,
+    requestIdValue: string,
+    input: ProcessResetRequestDto,
+    requestId?: string,
+  ) {
+    const reason = this.requiredReason(input.reason);
+    const claimed = await this.db.query<{ userId: string }>(
+      `UPDATE zenovel.password_reset_requests SET status=$2,reviewed_by=$3,
+       reviewed_at=now(),review_reason=$4,updated_at=now()
+       WHERE id=$1 AND status='PENDING' RETURNING user_id AS "userId"`,
+      [
+        requestIdValue,
+        input.action === 'ISSUE' ? 'ISSUED' : 'REJECTED',
+        actorId,
+        reason,
+      ],
+    );
+    const userId = claimed.rows[0]?.userId;
+    if (!userId)
+      throw new ConflictException('This request is no longer pending.');
+    let resetToken: string | undefined;
+    try {
+      if (input.action === 'ISSUE') {
+        resetToken = await this.auth.issueReset(
+          actorId,
+          userId,
+          requestId,
+          reason,
+        );
+        await this.db.query(
+          `UPDATE zenovel.password_reset_requests SET reset_token_id=(
+             SELECT id FROM zenovel.password_reset_tokens
+             WHERE user_id=$2 AND created_by=$3 ORDER BY created_at DESC LIMIT 1
+           ),updated_at=now() WHERE id=$1`,
+          [requestIdValue, userId, actorId],
+        );
+      }
+    } catch (error) {
+      await this.db.query(
+        `UPDATE zenovel.password_reset_requests SET status='PENDING',reviewed_by=NULL,
+         reviewed_at=NULL,review_reason=NULL,updated_at=now() WHERE id=$1`,
+        [requestIdValue],
+      );
+      throw error;
+    }
+    await this.authRepository.event({
+      actorUserId: actorId,
+      subjectUserId: userId,
+      eventType:
+        input.action === 'ISSUE'
+          ? 'password_reset_request_approved'
+          : 'password_reset_request_rejected',
+      outcome: 'success',
+      requestId,
+      reason,
+      context: { resetRequestId: requestIdValue },
+    });
+    return {
+      success: true,
+      ...(resetToken
+        ? {
+            resetToken,
+            delivery:
+              'Provide this 10-digit, single-use setup token through an approved out-of-band channel.',
+          }
+        : {}),
     };
   }
   async createRole(actorId: string, input: CreateRoleDto, requestId?: string) {

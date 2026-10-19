@@ -15,8 +15,10 @@ import { RequirePermissions, RequireRoles } from '../auth/auth.decorators.js';
 import type { AuthenticatedRequest } from '../auth/auth.types.js';
 import {
   AssignmentResponseDto,
+  CreateClientDto,
   CreateProjectDto,
   CreateVisitDto,
+  CreateVisitTypeDto,
   ExportQueryDto,
   MilestoneCorrectionDto,
   MilestoneDto,
@@ -25,6 +27,11 @@ import {
   TimelineOverrideDto,
   TrackerQueryDto,
   TransferProjectDto,
+  UpdateClientDto,
+  UpdateVisitDatesDto,
+  UpdateVisitTypeDto,
+  UpdateVisitAssignmentDto,
+  MonitorAvailabilityQueryDto,
 } from './projects.dto.js';
 import { ProjectsService } from './projects.service.js';
 
@@ -55,13 +62,94 @@ export class ProjectsController {
     'DIRECTOR',
     'DIRECTOR_OPERATIONS',
   )
-  options() {
-    return this.projects.options();
+  options(@Req() request: AuthenticatedRequest) {
+    return this.projects.options(request.auth!.user);
   }
 
   @Get('notifications')
   notifications(@Req() request: AuthenticatedRequest) {
     return this.projects.notifications(request.auth!.user);
+  }
+
+  @Get('visit-types')
+  visitTypes(@Req() request: AuthenticatedRequest) {
+    return this.projects.visitTypes(request.auth!.user);
+  }
+
+  @Post('visit-types')
+  @RequirePermissions()
+  @RequireRoles('ASSOCIATE_DIRECTOR_GCP')
+  createVisitType(
+    @Req() request: AuthenticatedRequest,
+    @Body() input: CreateVisitTypeDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.createVisitType(
+      request.auth!.user,
+      input,
+      this.requestId(response),
+    );
+  }
+
+  @Patch('visit-types/:id')
+  @RequirePermissions()
+  @RequireRoles('ASSOCIATE_DIRECTOR_GCP')
+  updateVisitType(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() input: UpdateVisitTypeDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.updateVisitType(
+      request.auth!.user,
+      id,
+      input,
+      this.requestId(response),
+    );
+  }
+
+  @Get('clients')
+  @RequireRoles(
+    'PROJECT_MANAGER',
+    'ASSOCIATE_DIRECTOR_GCP',
+    'QMS',
+    'DIRECTOR',
+    'DIRECTOR_OPERATIONS',
+  )
+  clients(@Req() request: AuthenticatedRequest) {
+    return this.projects.clients(request.auth!.user);
+  }
+
+  @Post('clients')
+  @RequirePermissions()
+  @RequireRoles('ASSOCIATE_DIRECTOR_GCP')
+  createClient(
+    @Req() request: AuthenticatedRequest,
+    @Body() input: CreateClientDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.createClient(
+      request.auth!.user,
+      input,
+      this.requestId(response),
+    );
+  }
+
+  @Patch('clients/:id')
+  @RequirePermissions()
+  @RequireRoles('ASSOCIATE_DIRECTOR_GCP')
+  updateClient(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() input: UpdateClientDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.updateClient(
+      request.auth!.user,
+      id,
+      input,
+      this.requestId(response),
+    );
   }
 
   @Get('tracker')
@@ -118,6 +206,22 @@ export class ProjectsController {
       request.auth!.user,
       input,
       this.requestId(response),
+    );
+  }
+
+  @Get('visits/monitor-availability')
+  @RequirePermissions()
+  @RequireRoles('PROJECT_MANAGER', 'ASSOCIATE_DIRECTOR_GCP')
+  monitorAvailability(
+    @Req() request: AuthenticatedRequest,
+    @Query() input: MonitorAvailabilityQueryDto,
+  ) {
+    return this.projects.monitorAvailability(
+      request.auth!.user,
+      input.monitorUserId,
+      input.visitStartDate,
+      input.visitEndDate,
+      input.excludeVisitId,
     );
   }
 
@@ -213,6 +317,40 @@ export class ProjectsController {
       visitId,
       input.workingDays,
       input.reason,
+      this.requestId(response),
+    );
+  }
+
+  @Patch('visits/:visitId/dates')
+  @RequirePermissions()
+  @RequireRoles('PROJECT_MANAGER', 'ASSOCIATE_DIRECTOR_GCP')
+  visitDates(
+    @Req() request: AuthenticatedRequest,
+    @Param('visitId', ParseUUIDPipe) visitId: string,
+    @Body() input: UpdateVisitDatesDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.updateVisitDates(
+      request.auth!.user,
+      visitId,
+      input,
+      this.requestId(response),
+    );
+  }
+
+  @Patch('visits/:visitId/assignment')
+  @RequirePermissions()
+  @RequireRoles('PROJECT_MANAGER', 'ASSOCIATE_DIRECTOR_GCP')
+  visitAssignment(
+    @Req() request: AuthenticatedRequest,
+    @Param('visitId', ParseUUIDPipe) visitId: string,
+    @Body() input: UpdateVisitAssignmentDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    return this.projects.updateVisitAssignment(
+      request.auth!.user,
+      visitId,
+      input,
       this.requestId(response),
     );
   }

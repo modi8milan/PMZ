@@ -701,7 +701,8 @@ tbody td {
   font-weight: 600;
   margin-top: 14px;
 }
-.select-field select {
+.select-field select,
+.select-field input {
   border: 1px solid #cecec8;
   background: white;
   border-radius: 7px;
@@ -905,11 +906,39 @@ tbody th small {
   font-size: 28px;
 }
 .metric-alert {
-  border-color: #d98589;
-  background: var(--error-bg);
+  border-color: var(--border);
 }
 .project-form {
   margin-top: 14px;
+}
+
+.master-data-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.master-data-list {
+  display: grid;
+  gap: 0.65rem;
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+}
+
+.master-data-list li {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+  padding-top: 0.65rem;
+}
+
+@media (max-width: 800px) {
+  .master-data-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .project-notifications {
   margin: 14px 0 0;
@@ -949,11 +978,59 @@ tbody th small {
   min-width: 1500px;
 }
 .tracker-overdue {
-  background: var(--error-bg);
+  background: transparent;
 }
 .tracker-overdue th,
 .tracker-overdue td {
-  border-bottom-color: #edc3c5;
+  border-bottom-color: var(--border);
+}
+
+.current-user {
+  display: grid;
+  line-height: 1.2;
+  text-align: right;
+}
+.current-user span,
+.current-user small {
+  color: var(--muted);
+}
+.projects-layout {
+  display: grid;
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+.projects-subnav {
+  display: grid;
+  gap: 6px;
+  position: sticky;
+  top: 82px;
+}
+.projects-subnav button {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 10px 12px;
+  text-align: left;
+}
+.projects-subnav button:hover,
+.projects-subnav button:focus-visible {
+  border-color: var(--border);
+  color: var(--text);
+}
+.projects-subnav button.active {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+  font-weight: 700;
+}
+.projects-main {
+  display: grid;
+  gap: 22px;
+  min-width: 0;
 }
 .checkbox-field {
   display: flex;
@@ -974,6 +1051,22 @@ tbody th small {
   .project-filters,
   .tracker-filters {
     grid-template-columns: repeat(2, minmax(150px, 1fr));
+  }
+}
+@media (max-width: 800px) {
+  .projects-layout {
+    grid-template-columns: 1fr;
+  }
+  .projects-subnav {
+    display: flex;
+    overflow-x: auto;
+    position: static;
+  }
+  .projects-subnav .eyebrow {
+    display: none;
+  }
+  .current-user {
+    display: none;
   }
 }
 @media (max-width: 760px) {

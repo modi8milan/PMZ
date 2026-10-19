@@ -88,6 +88,7 @@ class FakeRepository {
   resetAvailable = true;
   recoveryValid = false;
   mfaDisabled = false;
+  requestedRecoveryEmail = '';
   async findUserByUsername() {
     return this.account;
   }
@@ -148,6 +149,13 @@ class FakeRepository {
   }
   async issueReset() {
     return 'reset-id';
+  }
+  async requestPasswordReset(email: string) {
+    this.requestedRecoveryEmail = email;
+    return this.account?.id ?? null;
+  }
+  async loginMode() {
+    return this.account?.email ? ('email' as const) : ('username' as const);
   }
   async setMfaSecret() {}
   async enableMfa() {}
@@ -425,6 +433,36 @@ describe('first-administrator bootstrap token regression', () => {
 });
 
 describe('authentication lifecycle', () => {
+  it('normalizes email recovery requests without revealing account eligibility', async () => {
+    const repo = new FakeRepository();
+    repo.account = user({ email: 'monitor@example.test' });
+    const auth = service(repo);
+    await auth.requestRecovery(
+      ' Monitor@Example.Test ',
+      '127.0.0.1',
+      'recovery-request',
+    );
+    assert.equal(repo.requestedRecoveryEmail, 'monitor@example.test');
+    assert.equal(repo.events.at(-1)?.eventType, 'password_recovery_requested');
+    assert.equal(repo.events.at(-1)?.subjectUserId, repo.account.id);
+  });
+
+  it('uses a database-readiness gate for irreversible email-login cutover', async () => {
+    const repository = await readFile(
+      new URL('../../src/auth/auth.repository.ts', import.meta.url),
+      'utf8',
+    );
+    const controller = await readFile(
+      new URL('../../src/auth/auth.controller.ts', import.meta.url),
+      'utf8',
+    );
+    assert.match(repository, /status='active'/);
+    assert.match(repository, /email_ready AND lower\(btrim\(u\.email\)\)/);
+    assert.match(repository, /NOT r\.email_ready AND lower\(u\.username\)/);
+    assert.match(controller, /@Get\('login-mode'\)/);
+    assert.match(controller, /body\.email/);
+  });
+
   it('creates only hashed opaque session and CSRF identifiers for valid login', async () => {
     const repo = new FakeRepository();
     repo.account = user({

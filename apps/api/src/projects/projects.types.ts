@@ -82,6 +82,7 @@ export type ProjectRow = {
   sponsorProjectId: string;
   sponsorName: string | null;
   clientCode: string;
+  clientId: string | null;
   title: string;
   projectDetail: string | null;
   regulatorySubmissionDetails: string | null;
@@ -105,12 +106,14 @@ export type TrackerRow = ProjectRow & {
   visitId: string | null;
   visitSequence: number | null;
   visitType: string | null;
+  visitTypeId: string | null;
   visitStatus: VisitStatus | null;
   reportStatus: ReportStatus | null;
   capaStatus: CapaStatus | null;
   monitorName: string | null;
   agendaShared: boolean | null;
   reportFromMonitor: string | null;
+  visitStartDate: string | null;
   visitEndDate: string | null;
   visitEndRecordedAt: string | null;
   firstDraftSubmittedAt: string | null;
@@ -130,4 +133,19 @@ export type TrackerRow = ProjectRow & {
   sponsorReportOverdue: boolean | null;
   deviationRequired: boolean | null;
   deviationReported: boolean | null;
+};
+
+export type VisitTypeRow = {
+  id: string;
+  displayName: string;
+  active: boolean;
+  inUse: boolean;
+};
+
+export type ClientRow = {
+  id: string;
+  name: string;
+  code: string;
+  active: boolean;
+  inUse: boolean;
 };

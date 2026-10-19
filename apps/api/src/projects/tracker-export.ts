@@ -92,7 +92,30 @@ function zip(files: Array<{ name: string; body: string }>): Buffer {
   return Buffer.concat([...parts, ...directory, end]);
 }
 
-export function xlsxExport(headings: string[], rows: ExportCell[][]): Buffer {
+type TimelineStatus = 'MET' | 'MISSED' | 'PENDING' | 'NOT APPLICABLE';
+
+const timelineHeadings = new Set([
+  'Visit Start Date',
+  'Visit End Date',
+  'Report Shared to Sponsor',
+  'Sponsor Deadline',
+  'Sponsor-Report Timeline Status',
+  'Sponsor Report Overdue',
+  'Deviation Required',
+]);
+
+const statusStyle: Record<TimelineStatus, number> = {
+  MET: 2,
+  MISSED: 3,
+  PENDING: 4,
+  'NOT APPLICABLE': 5,
+};
+
+export function xlsxExport(
+  headings: string[],
+  rows: ExportCell[][],
+  statuses: TimelineStatus[] = [],
+): Buffer {
   const all = [headings, ...rows];
   const sheetRows = all
     .map(
@@ -101,9 +124,16 @@ export function xlsxExport(headings: string[], rows: ExportCell[][]): Buffer {
           .map((value, columnIndex) => {
             const column = columnName(columnIndex);
             const ref = `${column}${rowIndex + 1}`;
+            const style =
+              rowIndex === 0
+                ? 1
+                : timelineHeadings.has(headings[columnIndex] ?? '')
+                  ? statusStyle[statuses[rowIndex - 1] ?? 'NOT APPLICABLE']
+                  : 0;
+            const styleAttribute = style ? ` s="${style}"` : '';
             return typeof value === 'number'
-              ? `<c r="${ref}"><v>${value}</v></c>`
-              : `<c r="${ref}" t="inlineStr"><is><t>${xml(value)}</t></is></c>`;
+              ? `<c r="${ref}"${styleAttribute}><v>${value}</v></c>`
+              : `<c r="${ref}"${styleAttribute} t="inlineStr"><is><t>${xml(value)}</t></is></c>`;
           })
           .join('')}</row>`,
     )
@@ -111,7 +141,7 @@ export function xlsxExport(headings: string[], rows: ExportCell[][]): Buffer {
   return zip([
     {
       name: '[Content_Types].xml',
-      body: `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`,
+      body: `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`,
     },
     {
       name: '_rels/.rels',
@@ -123,11 +153,15 @@ export function xlsxExport(headings: string[], rows: ExportCell[][]): Buffer {
     },
     {
       name: 'xl/_rels/workbook.xml.rels',
-      body: `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`,
+      body: `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    },
+    {
+      name: 'xl/styles.xml',
+      body: `<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font><font><color rgb="FF000000"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="7"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE7E6E6"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="4" borderId="0" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="5" borderId="0" xfId="0" applyFill="1" applyFont="1"/><xf numFmtId="0" fontId="2" fillId="6" borderId="0" xfId="0" applyFill="1" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`,
     },
     {
       name: 'xl/worksheets/sheet1.xml',
-      body: `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>${sheetRows}</sheetData><autoFilter ref="A1:${columnName(headings.length - 1)}${all.length}"/></worksheet>`,
+      body: `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${headings.map((heading, index) => `<col min="${index + 1}" max="${index + 1}" width="${Math.min(40, Math.max(12, heading.length + 2))}" customWidth="1"/>`).join('')}</cols><sheetData>${sheetRows}</sheetData><autoFilter ref="A1:${columnName(headings.length - 1)}${all.length}"/></worksheet>`,
     },
   ]);
 }

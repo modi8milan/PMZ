@@ -274,14 +274,21 @@ export class AuthService {
       requestId,
     });
   }
-  async requestRecovery(username: string, requestId?: string): Promise<void> {
-    const user = await this.repository.findUserByUsername(username);
+  async requestRecovery(
+    email: string,
+    ip?: string,
+    requestId?: string,
+  ): Promise<void> {
+    const userId = await this.repository.requestPasswordReset(
+      email.trim().toLowerCase(),
+      ip ? tokenHash(ip) : undefined,
+    );
     await this.repository.event({
-      subjectUserId: user?.id,
+      subjectUserId: userId ?? undefined,
       eventType: 'password_recovery_requested',
       outcome: 'success',
       requestId,
-      context: { identityHash: tokenHash(username.toLowerCase()) },
+      context: { identityHash: tokenHash(email.trim().toLowerCase()) },
     });
   }
   async issueReset(

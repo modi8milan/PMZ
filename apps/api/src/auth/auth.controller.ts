@@ -150,12 +150,27 @@ export class AuthController {
   @Post('recovery')
   async recovery(
     @Body() body: RecoveryRequestDto,
+    @Req() request: Request,
     @Res({ passthrough: true }) response: Response,
   ) {
-    await this.auth.requestRecovery(body.username, this.requestId(response));
+    await this.auth.requestRecovery(
+      body.email,
+      request.ip,
+      this.requestId(response),
+    );
     return {
       message:
         'If the account is eligible, an authorized administrator can continue the recovery process.',
+    };
+  }
+  @Public()
+  @Get('login-mode')
+  async loginMode() {
+    const mode = await this.repository.loginMode();
+    return {
+      mode,
+      label: mode === 'email' ? 'Email Address' : 'User ID',
+      transition: mode !== 'email',
     };
   }
   @Public()

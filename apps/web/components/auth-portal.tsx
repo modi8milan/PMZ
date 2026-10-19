@@ -11,6 +11,7 @@ type Session = {
     id: string;
     username: string;
     fullName: string;
+    email: string | null;
     roles: string[];
     permissions: string[];
     mfaEnabled: boolean;
@@ -46,6 +47,7 @@ type UserRow = {
   id: string;
   username: string;
   fullName: string;
+  email: string | null;
   status: string;
   department: string | null;
   mustChangePassword: boolean;
@@ -61,6 +63,15 @@ type EventRow = {
   createdAt: string;
 };
 type AuditUser = { id: string; fullName: string };
+type PasswordResetRequest = {
+  id: string;
+  userId: string;
+  status: 'PENDING' | 'ISSUED' | 'REJECTED';
+  requestedAt: string;
+  fullName: string;
+  username: string;
+  email: string;
+};
 const api = apiBaseUrl();
 
 class ApiError extends Error {
@@ -245,6 +256,11 @@ export function AuthPortal() {
           </span>
           <div className="header-actions">
             <Badge tone="success">Authenticated</Badge>
+            <div className="current-user" aria-label="Current user">
+              <strong>{session.user.fullName}</strong>
+              <span>{session.user.email ?? 'Email setup pending'}</span>
+              <small>{session.user.roles.join(', ')}</small>
+            </div>
             <Button
               className="button-secondary"
               onClick={() =>
@@ -387,6 +403,11 @@ function SignIn({
   notice: string;
 }) {
   const [mode, setMode] = useState<'login' | 'recovery' | 'reset'>('login');
+  const [loginMode, setLoginMode] = useState<{
+    mode: 'email' | 'username';
+    label: string;
+    transition: boolean;
+  }>({ mode: 'username', label: 'User ID', transition: true });
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [authenticatorCode, setAuthenticatorCode] = useState('');
@@ -395,6 +416,13 @@ function SignIn({
     useState(false);
   const [token, setToken] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  useEffect(() => {
+    void call<{
+      mode: 'email' | 'username';
+      label: string;
+      transition: boolean;
+    }>('/auth/login-mode').then(setLoginMode);
+  }, []);
   const selectMode = (nextMode: 'login' | 'recovery' | 'reset') => {
     setMode(nextMode);
     setPassword('');
@@ -432,12 +460,15 @@ function SignIn({
             setAdministratorMfaRequested(true);
           throw loginError;
         }
-      } else if (mode === 'recovery')
+      } else if (mode === 'recovery') {
         await call('/auth/recovery', {
           method: 'POST',
-          body: JSON.stringify({ username }),
+          body: JSON.stringify({ email: username.trim().toLowerCase() }),
         });
-      else {
+        notify(
+          'Your request has been submitted if the email is registered. Please follow up with your administrator for reset instructions.',
+        );
+      } else {
         if (password !== confirmPassword)
           throw new Error('New password and confirmation do not match.');
         await call('/auth/reset', {
@@ -450,7 +481,7 @@ function SignIn({
         });
         selectMode('login');
         notify(
-          'Password set successfully. Sign in with your username and new password.',
+          `Password set successfully. Sign in with your ${loginMode.mode === 'email' ? 'email address' : 'User ID'} and new password.`,
         );
       }
     });
@@ -475,12 +506,23 @@ function SignIn({
         <form onSubmit={submit}>
           <Field
             id="username"
-            label="User ID"
+            label={mode === 'recovery' ? 'Email Address' : loginMode.label}
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             autoComplete="username"
+            type={
+              mode === 'recovery' || loginMode.mode === 'email'
+                ? 'email'
+                : 'text'
+            }
             required
           />
+          {mode !== 'recovery' && loginMode.transition && (
+            <p className="muted">
+              Email sign-in will activate after an administrator completes the
+              missing account email records.
+            </p>
+          )}
           {mode === 'reset' && (
             <Field
               id="token"
@@ -567,9 +609,7 @@ function SignIn({
               selectMode(mode === 'recovery' ? 'login' : 'recovery')
             }
           >
-            {mode === 'recovery'
-              ? 'Return to sign in'
-              : 'Need account recovery?'}
+            {mode === 'recovery' ? 'Return to sign in' : 'Forgot Password?'}
           </button>
           <button
             onClick={() => selectMode(mode === 'reset' ? 'login' : 'reset')}
@@ -935,6 +975,7 @@ function Users({
   const [catalogError, setCatalogError] = useState('');
   const [username, setUsername] = useState('');
   const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('');
   const [roleId, setRole] = useState('');
   const [departmentId, setDepartment] = useState('');
   const [createReason, setCreateReason] = useState('');
@@ -946,6 +987,9 @@ function Users({
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editingRoleIds, setEditingRoleIds] = useState<string[]>([]);
   const [roleReason, setRoleReason] = useState('');
+  const [resetRequests, setResetRequests] = useState<PasswordResetRequest[]>(
+    [],
+  );
   const loadUsers = useCallback(async () => {
     setUsersLoading(true);
     setUsersError('');
@@ -974,13 +1018,23 @@ function Users({
       );
     }
   }, []);
+  const loadResetRequests = useCallback(async () => {
+    try {
+      setResetRequests(
+        await call<PasswordResetRequest[]>('/admin/password-reset-requests'),
+      );
+    } catch {
+      setResetRequests([]);
+    }
+  }, []);
   useEffect(() => {
     const task = window.setTimeout(() => {
       void loadUsers();
       void loadCatalog();
+      void loadResetRequests();
     }, 0);
     return () => window.clearTimeout(task);
-  }, [loadCatalog, loadUsers]);
+  }, [loadCatalog, loadResetRequests, loadUsers]);
   const action = (path: string, method = 'POST', body?: object) =>
     act(async () => {
       const result = await call<{ resetToken?: string }>(
@@ -988,9 +1042,9 @@ function Users({
         { method, body: body ? JSON.stringify(body) : undefined },
         session.csrfToken,
       );
-      if (result.resetToken) setToken(result.resetToken);
+      setToken(result.resetToken ?? '');
       notify('Administrative action completed and recorded.');
-      await Promise.all([loadUsers(), loadCatalog()]);
+      await Promise.all([loadUsers(), loadCatalog(), loadResetRequests()]);
     });
   const reasonedAction = (
     label: string,
@@ -1044,6 +1098,7 @@ function Users({
             void action('/admin/users', 'POST', {
               username,
               fullName,
+              email: email.trim().toLowerCase(),
               roleIds: [roleId],
               departmentId: departmentId || undefined,
               reason: createReason,
@@ -1062,6 +1117,14 @@ function Users({
             label="Full name"
             value={fullName}
             onChange={(e) => setFullName(e.target.value)}
+            required
+          />
+          <Field
+            id="new-email"
+            label="Email Address"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
             required
           />
           <label className="select-field">
@@ -1118,6 +1181,76 @@ function Users({
         )}
       </Card>
       <Card className="wide-card">
+        <p className="eyebrow">ADMINISTRATOR REVIEW</p>
+        <h2>Password reset requests</h2>
+        {resetRequests.length === 0 ? (
+          <Feedback>No password reset requests have been recorded.</Feedback>
+        ) : (
+          <Table
+            caption="Password reset request history"
+            headings={['Account', 'Requested', 'Status', 'Controls']}
+          >
+            {resetRequests.map((item) => (
+              <tr key={item.id}>
+                <th scope="row">
+                  {item.fullName}
+                  <small>{item.email}</small>
+                  <small>{item.userId}</small>
+                </th>
+                <td>
+                  {displayDate(item.requestedAt, session.businessTimeZone)}
+                </td>
+                <td>
+                  <Badge
+                    tone={
+                      item.status === 'PENDING'
+                        ? 'warning'
+                        : item.status === 'ISSUED'
+                          ? 'success'
+                          : 'neutral'
+                    }
+                  >
+                    {item.status}
+                  </Badge>
+                </td>
+                <td className="table-actions">
+                  {item.status === 'PENDING' && (
+                    <>
+                      <Button
+                        className="button-small"
+                        onClick={() =>
+                          reasonedAction(
+                            'issuing a password reset token',
+                            `/admin/password-reset-requests/${item.id}`,
+                            'POST',
+                            { action: 'ISSUE' },
+                          )
+                        }
+                      >
+                        Issue token
+                      </Button>
+                      <Button
+                        className="button-small button-secondary"
+                        onClick={() =>
+                          reasonedAction(
+                            'rejecting this password reset request',
+                            `/admin/password-reset-requests/${item.id}`,
+                            'POST',
+                            { action: 'REJECT' },
+                          )
+                        }
+                      >
+                        Reject
+                      </Button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </Card>
+      <Card className="wide-card">
         <Field
           id="admin-reauthentication"
           label="Administrator password for sensitive MFA reset"
@@ -1165,6 +1298,7 @@ function Users({
                 <th scope="row">
                   {u.fullName}
                   <small>{u.username}</small>
+                  <small>{u.email ?? 'Email setup pending'}</small>
                 </th>
                 <td>{u.department ?? 'Unassigned'}</td>
                 <td>
@@ -1243,6 +1377,23 @@ function Users({
                     disabled={!catalog}
                   >
                     Edit roles
+                  </Button>
+                  <Button
+                    className="button-small button-secondary"
+                    onClick={() => {
+                      const nextEmail = window.prompt(
+                        `Email Address for ${u.fullName}`,
+                        u.email ?? '',
+                      );
+                      if (!nextEmail?.trim()) return;
+                      void action(`/admin/users/${u.id}`, 'PATCH', {
+                        email: nextEmail.trim().toLowerCase(),
+                      }).then(() => {
+                        if (u.id === session.user.id) window.location.reload();
+                      });
+                    }}
+                  >
+                    {u.email ? 'Edit email' : 'Add email'}
                   </Button>
                   <Button
                     className="button-small button-secondary"

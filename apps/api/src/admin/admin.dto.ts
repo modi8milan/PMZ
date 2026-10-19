@@ -17,13 +17,17 @@ import {
 export class CreateUserDto {
   @IsString() @MinLength(3) @MaxLength(100) username!: string;
   @IsString() @MinLength(2) @MaxLength(160) fullName!: string;
-  @IsOptional() @IsEmail() @MaxLength(254) email?: string;
+  @IsEmail() @MaxLength(254) email!: string;
   @IsOptional() @IsUUID() departmentId?: string;
   @IsArray()
   @ArrayMinSize(1)
   @ArrayUnique()
   @IsUUID('4', { each: true })
   roleIds!: string[];
+  @IsString() @Matches(/\S/) @MaxLength(500) reason!: string;
+}
+export class ProcessResetRequestDto {
+  @IsIn(['ISSUE', 'REJECT']) action!: 'ISSUE' | 'REJECT';
   @IsString() @Matches(/\S/) @MaxLength(500) reason!: string;
 }
 export class UpdateUserDto {

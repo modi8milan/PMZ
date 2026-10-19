@@ -9,7 +9,10 @@ import { AuthRepository } from '../auth/auth.repository.js';
 import type { AuthUser } from '../auth/auth.types.js';
 import type {
   CreateProjectDto,
+  CreateClientDto,
   CreateVisitDto,
+  CreateVisitTypeDto,
+  UpdateVisitAssignmentDto,
   ProjectQueryDto,
   TrackerQueryDto,
 } from './projects.dto.js';
@@ -44,11 +47,13 @@ const headings = [
   'CAPA Status',
   'Monitor',
   'Agenda Shared',
+  'Visit Start Date',
   'Visit End Date',
   'Report from Monitor / Auditor',
   'First Draft Submitted',
   'Report Shared to Sponsor',
   'Sponsor Deadline',
+  'Sponsor-Report Timeline Status',
   'Sponsor Report Overdue',
   'Deviation Required',
   'Deviation Reported',
@@ -64,7 +69,25 @@ const headings = [
   'Final Archival Date',
 ];
 
-function exportRow(row: TrackerRow) {
+export type TimelineStatus = 'MET' | 'MISSED' | 'PENDING' | 'NOT APPLICABLE';
+
+export function timelineStatus(
+  row: TrackerRow,
+  businessDate: string,
+  sharedBusinessDate?: string,
+): TimelineStatus {
+  if (row.sponsorReportOverdue) return 'MISSED';
+  if (!row.visitEndDate || !row.sponsorDeadlineDate) return 'NOT APPLICABLE';
+  if (row.reportSharedToSponsorAt) {
+    return (sharedBusinessDate ?? row.reportSharedToSponsorAt.slice(0, 10)) <=
+      row.sponsorDeadlineDate
+      ? 'MET'
+      : 'MISSED';
+  }
+  return businessDate > row.sponsorDeadlineDate ? 'MISSED' : 'PENDING';
+}
+
+function exportRow(row: TrackerRow, status: TimelineStatus) {
   return [
     Number(row.serialNo),
     row.sponsorName,
@@ -84,11 +107,13 @@ function exportRow(row: TrackerRow) {
     row.capaStatus,
     row.monitorName,
     row.agendaShared,
+    row.visitStartDate,
     row.visitEndDate,
     row.reportFromMonitor,
     row.firstDraftSubmittedAt,
     row.reportSharedToSponsorAt,
     row.sponsorDeadlineDate,
+    status,
     row.sponsorReportOverdue,
     row.deviationRequired,
     row.deviationReported,
@@ -134,15 +159,160 @@ export class ProjectsService {
     return { access, project };
   }
 
-  async options() {
-    const rows = await this.projects.options();
+  async options(user: AuthUser) {
+    const includeInactive = user.roles.includes('ASSOCIATE_DIRECTOR_GCP');
+    const [rows, clients, visitTypes] = await Promise.all([
+      this.projects.options(),
+      this.projects.clients(includeInactive),
+      this.projects.visitTypes(includeInactive),
+    ]);
     return {
       projectManagers: rows.filter((row) => row.role === 'PROJECT_MANAGER'),
       monitors: rows.filter((row) => row.role === 'CRA_MONITOR'),
+      clients,
+      visitTypes,
     };
   }
 
+  visitTypes(user: AuthUser) {
+    return this.projects.visitTypes(
+      user.roles.includes('ASSOCIATE_DIRECTOR_GCP'),
+    );
+  }
+
+  clients(user: AuthUser) {
+    if (user.roles.includes('CRA_MONITOR')) throw new ForbiddenException();
+    return this.projects.clients(user.roles.includes('ASSOCIATE_DIRECTOR_GCP'));
+  }
+
+  async createVisitType(
+    user: AuthUser,
+    input: CreateVisitTypeDto,
+    requestId?: string,
+  ) {
+    this.requireAssociateDirector(user);
+    try {
+      const value = await this.projects.createVisitType(input, user.id);
+      await this.audit.event({
+        actorUserId: user.id,
+        eventType: 'visit_type_created',
+        outcome: 'success',
+        requestId,
+        context: { visitTypeId: value.id },
+      });
+      return value;
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505')
+        throw new ConflictException(
+          'A visit type with this name already exists.',
+        );
+      throw error;
+    }
+  }
+
+  async updateVisitType(
+    user: AuthUser,
+    id: string,
+    input: { displayName?: string; active?: boolean },
+    requestId?: string,
+  ) {
+    this.requireAssociateDirector(user);
+    if (input.displayName === undefined && input.active === undefined)
+      throw new BadRequestException('Provide a name or active status.');
+    try {
+      const value = await this.projects.updateVisitType(id, input, user.id);
+      if (!value) throw new NotFoundException();
+      await this.audit.event({
+        actorUserId: user.id,
+        eventType: 'visit_type_updated',
+        outcome: 'success',
+        requestId,
+        context: { visitTypeId: id, active: value.active },
+      });
+      return value;
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505')
+        throw new ConflictException(
+          'A visit type with this name already exists.',
+        );
+      throw error;
+    }
+  }
+
+  async createClient(
+    user: AuthUser,
+    input: CreateClientDto,
+    requestId?: string,
+  ) {
+    this.requireAssociateDirector(user);
+    try {
+      const value = await this.projects.createClient(input, user.id);
+      await this.audit.event({
+        actorUserId: user.id,
+        eventType: 'client_created',
+        outcome: 'success',
+        requestId,
+        context: { clientId: value.id },
+      });
+      return value;
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        const constraint = (error as { constraint?: string }).constraint ?? '';
+        if (constraint.includes('normalized_code'))
+          throw new ConflictException(
+            'A client with this code already exists.',
+          );
+        throw new ConflictException('A client with this name already exists.');
+      }
+      throw error;
+    }
+  }
+
+  async updateClient(
+    user: AuthUser,
+    id: string,
+    input: { name?: string; code?: string; active?: boolean },
+    requestId?: string,
+  ) {
+    this.requireAssociateDirector(user);
+    if (
+      input.name === undefined &&
+      input.code === undefined &&
+      input.active === undefined
+    )
+      throw new BadRequestException('Provide client details or active status.');
+    try {
+      const value = await this.projects.updateClient(id, input, user.id);
+      if (!value) throw new NotFoundException();
+      await this.audit.event({
+        actorUserId: user.id,
+        eventType: 'client_updated',
+        outcome: 'success',
+        requestId,
+        context: { clientId: id, active: value.active },
+      });
+      return value;
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        const constraint = (error as { constraint?: string }).constraint ?? '';
+        if (constraint.includes('normalized_code'))
+          throw new ConflictException(
+            'A client with this code already exists.',
+          );
+        throw new ConflictException('A client with this name already exists.');
+      }
+      throw error;
+    }
+  }
+
+  private requireAssociateDirector(user: AuthUser) {
+    if (!user.roles.includes('ASSOCIATE_DIRECTOR_GCP'))
+      throw new ForbiddenException();
+  }
+
   async create(user: AuthUser, input: CreateProjectDto, requestId?: string) {
+    if (!(await this.projects.activeClient(input.clientId)))
+      throw new BadRequestException('The selected client is unavailable.');
     if (!(await this.projects.isEligible(input.pmUserId, 'PROJECT_MANAGER')))
       throw new BadRequestException(
         'The selected project manager is unavailable.',
@@ -159,6 +329,8 @@ export class ProjectsService {
       );
     try {
       const project = await this.projects.create(input, user.id);
+      if (!project)
+        throw new BadRequestException('The selected client is unavailable.');
       await this.audit.event({
         actorUserId: user.id,
         subjectUserId: input.pmUserId,
@@ -339,18 +511,40 @@ export class ProjectsService {
       !(await this.projects.isEligible(input.monitorUserId, 'CRA_MONITOR'))
     )
       throw new BadRequestException('The selected monitor is unavailable.');
+    if (input.monitorUserId && (!input.visitStartDate || !input.visitEndDate))
+      throw new BadRequestException(
+        'Visit start and end dates are required when assigning a monitor.',
+      );
+    if (
+      input.visitStartDate &&
+      input.visitEndDate &&
+      input.visitEndDate < input.visitStartDate
+    )
+      throw new BadRequestException(
+        'Visit End Date cannot be earlier than Visit Start Date.',
+      );
+    const visitType = await this.projects.activeVisitType(input.visitTypeId);
+    if (!visitType)
+      throw new BadRequestException('The selected visit type is unavailable.');
     const calendar = input.visitEndDate
       ? await this.projects.calendar(input.visitEndDate)
       : new Map<string, boolean>();
     const deadline = input.visitEndDate
       ? this.businessTime.deadline(input.visitEndDate, 5, calendar)
       : null;
-    const visit = await this.projects.createVisit(
-      projectId,
-      input,
-      user.id,
-      deadline,
-    );
+    let visit;
+    try {
+      visit = await this.projects.createVisit(
+        projectId,
+        input,
+        user.id,
+        deadline,
+        visitType.displayName,
+      );
+    } catch (error) {
+      this.throwMonitorConflict(error);
+      throw error;
+    }
     if (!visit) throw new NotFoundException();
     await this.audit.event({
       actorUserId: user.id,
@@ -364,6 +558,179 @@ export class ProjectsService {
       },
     });
     return { ...visit, sponsorDeadlineDate: deadline };
+  }
+
+  async updateVisitDates(
+    user: AuthUser,
+    visitId: string,
+    input: { visitStartDate?: string; visitEndDate?: string; reason: string },
+    requestId?: string,
+  ) {
+    const visit = await this.projects.visitForUpdate(visitId);
+    if (!visit) throw new NotFoundException();
+    const { project } = await this.requireProject(user, visit.projectId);
+    if (
+      !user.roles.some((role) =>
+        ['PROJECT_MANAGER', 'ASSOCIATE_DIRECTOR_GCP'].includes(role),
+      )
+    )
+      throw new ForbiddenException();
+    if (user.roles.includes('PROJECT_MANAGER') && project.pmUserId !== user.id)
+      throw new ForbiddenException();
+    const startDate = input.visitStartDate ?? visit.visitStartDate;
+    const endDate = input.visitEndDate ?? visit.visitEndDate;
+    if (startDate && endDate && endDate < startDate)
+      throw new BadRequestException(
+        'Visit End Date cannot be earlier than Visit Start Date.',
+      );
+    const calendar = endDate
+      ? await this.projects.calendar(endDate)
+      : new Map<string, boolean>();
+    const deadline = endDate
+      ? this.businessTime.deadline(
+          endDate,
+          visit.sponsorTimelineWorkingDays,
+          calendar,
+        )
+      : null;
+    let previous;
+    try {
+      previous = await this.projects.updateVisitDates(
+        visitId,
+        startDate,
+        endDate,
+        deadline,
+        user.id,
+        input.reason,
+      );
+    } catch (error) {
+      this.throwMonitorConflict(error);
+      throw error;
+    }
+    if (!previous) throw new NotFoundException();
+    await this.audit.event({
+      actorUserId: user.id,
+      eventType: 'project_visit_dates_changed',
+      outcome: 'success',
+      requestId,
+      reason: input.reason,
+      context: {
+        projectId: visit.projectId,
+        visitId,
+        beforeStartDate: previous.visitStartDate,
+        afterStartDate: startDate,
+        beforeEndDate: previous.visitEndDate,
+        afterEndDate: endDate,
+        beforeDeadline: previous.sponsorDeadlineDate,
+        afterDeadline: deadline,
+      },
+    });
+    return {
+      visitId,
+      visitStartDate: startDate,
+      visitEndDate: endDate,
+      sponsorDeadlineDate: deadline,
+    };
+  }
+
+  async monitorAvailability(
+    user: AuthUser,
+    monitorUserId: string,
+    startDate: string,
+    endDate: string,
+    excludeVisitId?: string,
+  ) {
+    this.access(user);
+    if (endDate < startDate)
+      throw new BadRequestException(
+        'Visit End Date cannot be earlier than Visit Start Date.',
+      );
+    const conflict = await this.projects.availability(
+      monitorUserId,
+      startDate,
+      endDate,
+      excludeVisitId,
+    );
+    return {
+      available: !conflict,
+      ...(conflict
+        ? {
+            conflict: {
+              visitStartDate: conflict.visitStartDate,
+              visitEndDate: conflict.visitEndDate,
+            },
+          }
+        : {}),
+    };
+  }
+
+  async updateVisitAssignment(
+    user: AuthUser,
+    visitId: string,
+    input: UpdateVisitAssignmentDto,
+    requestId?: string,
+  ) {
+    const visit = await this.projects.visitForUpdate(visitId);
+    if (!visit) throw new NotFoundException();
+    const { project } = await this.requireProject(user, visit.projectId);
+    if (
+      !user.roles.some((role) =>
+        ['PROJECT_MANAGER', 'ASSOCIATE_DIRECTOR_GCP'].includes(role),
+      )
+    )
+      throw new ForbiddenException();
+    if (user.roles.includes('PROJECT_MANAGER') && project.pmUserId !== user.id)
+      throw new ForbiddenException();
+    const monitorUserId = input.monitorUserId ?? null;
+    if (
+      monitorUserId &&
+      !(await this.projects.isEligible(monitorUserId, 'CRA_MONITOR'))
+    )
+      throw new BadRequestException('The selected monitor is unavailable.');
+    let result;
+    try {
+      result = await this.projects.updateVisitMonitor(
+        visitId,
+        monitorUserId,
+        user.id,
+        input.reason,
+      );
+    } catch (error) {
+      this.throwMonitorConflict(error);
+      throw error;
+    }
+    if (!result) throw new NotFoundException();
+    if (result.unchanged)
+      throw new ConflictException('The selected monitor is already assigned.');
+    await this.audit.event({
+      actorUserId: user.id,
+      subjectUserId: monitorUserId ?? result.previousMonitorId ?? undefined,
+      eventType: 'project_visit_monitor_changed',
+      outcome: 'success',
+      requestId,
+      reason: input.reason,
+      context: {
+        projectId: result.projectId,
+        visitId,
+        previousMonitorId: result.previousMonitorId,
+        newMonitorId: monitorUserId,
+      },
+    });
+    return { success: true, monitorUserId };
+  }
+
+  private throwMonitorConflict(error: unknown): void {
+    const value = error as {
+      code?: string;
+      conflict?: { visitStartDate: string; visitEndDate: string };
+    };
+    if (value.code !== 'MONITOR_SCHEDULE_CONFLICT') return;
+    const range = value.conflict
+      ? ` Existing assignment: ${value.conflict.visitStartDate} to ${value.conflict.visitEndDate}.`
+      : '';
+    throw new ConflictException(
+      `The selected monitor already has an overlapping visit assignment.${range}`,
+    );
   }
 
   async tracker(user: AuthUser, query: TrackerQueryDto) {
@@ -387,10 +754,24 @@ export class ProjectsService {
   async export(user: AuthUser, query: TrackerQueryDto, format: 'csv' | 'xlsx') {
     const access = this.access(user);
     const result = await this.projects.tracker(access, query, false);
-    const rows = result.items.map(exportRow);
+    const businessDate = this.businessTime.businessDate();
+    const statusFor = (row: TrackerRow) =>
+      timelineStatus(
+        row,
+        businessDate,
+        row.reportSharedToSponsorAt
+          ? this.businessTime.businessDate(
+              new Date(row.reportSharedToSponsorAt),
+            )
+          : undefined,
+      );
+    const statuses = result.items.map(statusFor);
+    const rows = result.items.map((row, index) =>
+      exportRow(row, statuses[index] ?? 'NOT APPLICABLE'),
+    );
     return format === 'csv'
       ? csvExport(headings, rows)
-      : xlsxExport(headings, rows);
+      : xlsxExport(headings, rows, statuses);
   }
 
   async overrideTimeline(

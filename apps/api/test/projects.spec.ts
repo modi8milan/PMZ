@@ -1,6 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { inflateRawSync } from 'node:zlib';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
@@ -29,8 +30,14 @@ import {
   TrackerQueryDto,
   TimelineOverrideDto,
 } from '../src/projects/projects.dto.js';
-import { ProjectsService } from '../src/projects/projects.service.js';
-import { projectAccess } from '../src/projects/projects.types.js';
+import {
+  ProjectsService,
+  timelineStatus,
+} from '../src/projects/projects.service.js';
+import {
+  projectAccess,
+  type TrackerRow,
+} from '../src/projects/projects.types.js';
 import type { ProjectsRepository } from '../src/projects/projects.repository.js';
 import { BusinessTimeService } from '../src/projects/business-time.service.js';
 import { OverdueProcessor } from '../src/projects/overdue.processor.js';
@@ -94,6 +101,7 @@ const project = {
   sponsorProjectId: 'SPONSOR-SECRET-1',
   sponsorName: 'Confidential Sponsor',
   clientCode: 'CLIENT-01',
+  clientId: '00000000-0000-4000-8000-000000000501',
   title: 'Study title',
   projectDetail: null,
   regulatorySubmissionDetails: null,
@@ -131,8 +139,95 @@ class FakeProjectsRepository {
   }> = [];
   overdueBusinessDates: string[] = [];
   lastMilestoneType: string | null = null;
+  monitorConflict: {
+    visitId: string;
+    visitStartDate: string;
+    visitEndDate: string;
+  } | null = null;
+  monitorAssignment: string | null = null;
+  clientConstraint = '';
+  visitTypeRows = [
+    {
+      id: '00000000-0000-4000-8000-000000000601',
+      displayName: 'SIV',
+      active: true,
+      inUse: false,
+    },
+  ];
+  clientRows = [
+    {
+      id: project.clientId,
+      name: project.sponsorName,
+      code: project.clientCode,
+      active: true,
+      inUse: true,
+    },
+  ];
   async options() {
     return [];
+  }
+  async clients() {
+    return this.clientRows;
+  }
+  async activeClient() {
+    return {
+      id: project.clientId,
+      name: project.sponsorName,
+      code: project.clientCode,
+    };
+  }
+  async visitTypes() {
+    return this.visitTypeRows;
+  }
+  async activeVisitType() {
+    return { id: '00000000-0000-4000-8000-000000000601', displayName: 'SIV' };
+  }
+  async createVisitType(input: { displayName: string }) {
+    const row = {
+      id: '00000000-0000-4000-8000-000000000602',
+      displayName: input.displayName,
+      active: true,
+      inUse: false,
+    };
+    this.visitTypeRows.push(row);
+    return row;
+  }
+  async updateVisitType(
+    id: string,
+    input: { displayName?: string; active?: boolean },
+  ) {
+    const row = this.visitTypeRows.find((item) => item.id === id);
+    if (!row) return null;
+    if (input.displayName !== undefined) row.displayName = input.displayName;
+    if (input.active !== undefined) row.active = input.active;
+    return row;
+  }
+  async createClient(input: { name: string; code: string }) {
+    if (this.clientConstraint)
+      throw Object.assign(new Error('duplicate'), {
+        code: '23505',
+        constraint: this.clientConstraint,
+      });
+    const row = {
+      id: '00000000-0000-4000-8000-000000000502',
+      name: input.name,
+      code: input.code,
+      active: true,
+      inUse: false,
+    };
+    this.clientRows.push(row);
+    return row;
+  }
+  async updateClient(
+    id: string,
+    input: { name?: string; code?: string; active?: boolean },
+  ) {
+    const row = this.clientRows.find((item) => item.id === id);
+    if (!row) return null;
+    if (input.name !== undefined) row.name = input.name;
+    if (input.code !== undefined) row.code = input.code;
+    if (input.active !== undefined) row.active = input.active;
+    return row;
   }
   async isEligible() {
     return true;
@@ -186,7 +281,14 @@ class FakeProjectsRepository {
     _input: unknown,
     _actorId: string,
     deadline: string | null,
+    _visitTypeName: string,
   ) {
+    void _visitTypeName;
+    if (this.monitorConflict)
+      throw Object.assign(new Error('conflict'), {
+        code: 'MONITOR_SCHEDULE_CONFLICT',
+        conflict: this.monitorConflict,
+      });
     const visit = {
       id: `00000000-0000-4000-8000-${String(this.visits.length + 1).padStart(12, '0')}`,
       projectId,
@@ -200,9 +302,12 @@ class FakeProjectsRepository {
     return {
       id: '00000000-0000-4000-8000-000000000401',
       projectId: project.id,
+      visitStartDate: null,
       visitEndDate: '2026-10-16',
       sponsorTimelineWorkingDays: 5,
       sponsorDeadlineDate: '2026-10-23',
+      monitorUserId: this.monitorAssignment,
+      visitStatus: 'PLANNED',
     };
   }
   async overrideTimeline(
@@ -217,6 +322,52 @@ class FakeProjectsRepository {
       visitEndDate: '2026-10-16',
       sponsorTimelineWorkingDays: 5,
       sponsorDeadlineDate: '2026-10-23',
+    };
+  }
+  async updateVisitDates(
+    _visitId: string,
+    startDate: string | null,
+    endDate: string | null,
+    deadline: string | null,
+  ) {
+    if (this.monitorConflict)
+      throw Object.assign(new Error('conflict'), {
+        code: 'MONITOR_SCHEDULE_CONFLICT',
+        conflict: this.monitorConflict,
+      });
+    const previous = await this.visitForUpdate();
+    void startDate;
+    void endDate;
+    void deadline;
+    return {
+      ...previous,
+      visitStartDate: null,
+      visitEndDate: '2026-10-16',
+      sponsorDeadlineDate: '2026-10-23',
+    };
+  }
+  async availability() {
+    return this.monitorConflict;
+  }
+  async updateVisitMonitor(_visitId: string, monitorUserId: string | null) {
+    if (this.monitorConflict)
+      throw Object.assign(new Error('conflict'), {
+        code: 'MONITOR_SCHEDULE_CONFLICT',
+        conflict: this.monitorConflict,
+      });
+    const previousMonitorId = this.monitorAssignment;
+    if (previousMonitorId === monitorUserId)
+      return {
+        projectId: project.id,
+        previousMonitorId,
+        unchanged: true,
+      };
+    this.monitorAssignment = monitorUserId;
+    return {
+      projectId: project.id,
+      previousMonitorId,
+      newMonitorId: monitorUserId,
+      unchanged: false,
     };
   }
   async milestone(_visitId: string, type: string) {
@@ -245,6 +396,64 @@ class FakeAuditRepository {
   async event(value: SecurityEvent) {
     this.events.push(value);
   }
+}
+
+function zipEntries(buffer: Buffer) {
+  const files = new Map<string, string>();
+  let offset = 0;
+  while (buffer.readUInt32LE(offset) === 0x04034b50) {
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const bodyStart = nameStart + nameLength + extraLength;
+    const name = buffer.subarray(nameStart, nameStart + nameLength).toString();
+    files.set(
+      name,
+      inflateRawSync(
+        buffer.subarray(bodyStart, bodyStart + compressedSize),
+      ).toString(),
+    );
+    offset = bodyStart + compressedSize;
+  }
+  return files;
+}
+
+function timelineRow(overrides: Partial<TrackerRow>): TrackerRow {
+  return {
+    ...project,
+    visitId: '00000000-0000-4000-8000-000000000401',
+    visitSequence: 1,
+    visitType: 'SIV',
+    visitTypeId: '00000000-0000-4000-8000-000000000601',
+    visitStatus: 'COMPLETED',
+    reportStatus: 'FINAL_APPROVED',
+    capaStatus: 'NOT_APPLICABLE',
+    monitorName: 'Monitor',
+    agendaShared: true,
+    reportFromMonitor: null,
+    visitStartDate: '2026-10-15',
+    visitEndDate: '2026-10-16',
+    visitEndRecordedAt: null,
+    firstDraftSubmittedAt: null,
+    reportSharedToSponsorAt: null,
+    signedReportSharedAt: null,
+    sponsorApproval: null,
+    mfrToCro: null,
+    capaFromCro: null,
+    capaReceivedDate: null,
+    studyResult: null,
+    sourceDocumentsStatus: null,
+    qmsArchivalSubmission: null,
+    comments: null,
+    finalArchivalDate: null,
+    sponsorTimelineWorkingDays: 5,
+    sponsorDeadlineDate: '2026-10-23',
+    sponsorReportOverdue: false,
+    deviationRequired: false,
+    deviationReported: false,
+    ...overrides,
+  };
 }
 
 describe('Stage 3 project rules', () => {
@@ -278,8 +487,7 @@ describe('Stage 3 project rules', () => {
     const input = Object.assign(new CreateProjectDto(), {
       inHouseProjectId: 'ZEN-001',
       sponsorProjectId: 'SP-1',
-      sponsorName: 'Sponsor',
-      clientCode: 'C-1',
+      clientId: project.clientId,
       title: 'Trial',
       receiptDate: 'not-a-date',
       pmUserId: 'not-a-uuid',
@@ -403,8 +611,7 @@ describe('Stage 3 project rules', () => {
       {
         inHouseProjectId: 'ZEN-001',
         sponsorProjectId: 'SP-1',
-        sponsorName: 'Sponsor',
-        clientCode: 'C-1',
+        clientId: project.clientId,
         title: 'Trial',
         receiptDate: '2026-10-15',
         pmUserId: project.pmUserId,
@@ -427,8 +634,7 @@ describe('Stage 3 project rules', () => {
       service.create(actor({ roles: ['ASSOCIATE_DIRECTOR_GCP'] }), {
         inHouseProjectId: 'ZEN-001',
         sponsorProjectId: 'SP-1',
-        sponsorName: 'Sponsor',
-        clientCode: 'C-1',
+        clientId: project.clientId,
         title: 'Trial',
         receiptDate: '2026-10-15',
         pmUserId: project.pmUserId,
@@ -461,15 +667,358 @@ describe('Stage 3 project rules', () => {
     assert.ok(xlsx.length > 500);
   });
 
+  it('classifies every sponsor-sharing timeline state without erasing late results', () => {
+    const due = '2026-10-23';
+    assert.equal(
+      timelineStatus(
+        timelineRow({ reportSharedToSponsorAt: '2026-10-22T10:00:00Z' }),
+        '2026-10-24',
+        '2026-10-22',
+      ),
+      'MET',
+    );
+    assert.equal(
+      timelineStatus(
+        timelineRow({ reportSharedToSponsorAt: '2026-10-23T10:00:00Z' }),
+        '2026-10-24',
+        due,
+      ),
+      'MET',
+    );
+    assert.equal(
+      timelineStatus(
+        timelineRow({ reportSharedToSponsorAt: '2026-10-24T10:00:00Z' }),
+        '2026-10-24',
+        '2026-10-24',
+      ),
+      'MISSED',
+    );
+    assert.equal(timelineStatus(timelineRow({}), '2026-10-24'), 'MISSED');
+    assert.equal(timelineStatus(timelineRow({}), '2026-10-22'), 'PENDING');
+    assert.equal(
+      timelineStatus(
+        timelineRow({ visitEndDate: null, sponsorDeadlineDate: null }),
+        '2026-10-24',
+      ),
+      'NOT APPLICABLE',
+    );
+    assert.equal(
+      timelineStatus(
+        timelineRow({
+          sponsorReportOverdue: true,
+          sponsorDeadlineDate: '2026-10-30',
+          reportSharedToSponsorAt: '2026-10-25T10:00:00Z',
+        }),
+        '2026-10-26',
+        '2026-10-25',
+      ),
+      'MISSED',
+    );
+  });
+
+  it('generates a styled workbook and colors every timeline cell by status', () => {
+    const headings = [
+      'Visit Start Date',
+      'Visit End Date',
+      'Sponsor Deadline',
+      'Report Shared to Sponsor',
+      'Sponsor-Report Timeline Status',
+      'Sponsor Report Overdue',
+      'Deviation Required',
+    ];
+    const statuses = ['MET', 'MISSED', 'PENDING', 'NOT APPLICABLE'] as const;
+    const workbook = xlsxExport(
+      headings,
+      statuses.map((status) => [
+        '2026-10-15',
+        '2026-10-16',
+        '2026-10-23',
+        '',
+        status,
+        status === 'MISSED',
+        status === 'MISSED',
+      ]),
+      [...statuses],
+    );
+    const entries = zipEntries(workbook);
+    const styles = entries.get('xl/styles.xml') ?? '';
+    const sheet = entries.get('xl/worksheets/sheet1.xml') ?? '';
+    assert.match(styles, /FFC6EFCE/);
+    assert.match(styles, /FFFFC7CE/);
+    assert.match(styles, /FFFFEB9C/);
+    assert.match(styles, /FFE7E6E6/);
+    for (const [row, style] of [
+      [2, 2],
+      [3, 3],
+      [4, 4],
+      [5, 5],
+    ] as const)
+      for (const column of ['A', 'B', 'C', 'D', 'E', 'F', 'G'])
+        assert.match(sheet, new RegExp(`<c r="${column}${row}" s="${style}"`));
+    assert.match(sheet, /autoFilter ref="A1:G5"/);
+  });
+
+  it('allows only Associate Director GCP to manage client and visit-type catalogues', async () => {
+    const repository = new FakeProjectsRepository();
+    const service = projectsService(repository);
+    const associateDirector = actor({ roles: ['ASSOCIATE_DIRECTOR_GCP'] });
+    const visitType = await service.createVisitType(associateDirector, {
+      displayName: 'Close-out Review',
+    });
+    assert.equal(visitType.displayName, 'Close-out Review');
+    const client = await service.createClient(associateDirector, {
+      name: 'Test Sponsor',
+      code: 'TS-01',
+    });
+    assert.equal(client.code, 'TS-01');
+    await assert.rejects(
+      service.createVisitType(actor(), { displayName: 'Unauthorized' }),
+      { status: 403 },
+    );
+    await assert.rejects(
+      service.createClient(actor(), { name: 'Unauthorized', code: 'NO-01' }),
+      { status: 403 },
+    );
+  });
+
+  it('returns an exact safe message for normalized duplicate client codes', async () => {
+    const repository = new FakeProjectsRepository();
+    repository.clientConstraint = 'clients_normalized_code_key';
+    const service = projectsService(repository);
+    await assert.rejects(
+      service.createClient(actor({ roles: ['ASSOCIATE_DIRECTOR_GCP'] }), {
+        name: 'Another Sponsor',
+        code: ' client-01 ',
+      }),
+      (error: unknown) => {
+        const value = error as { status: number; message: string };
+        return (
+          value.status === 409 &&
+          value.message === 'A client with this code already exists.'
+        );
+      },
+    );
+  });
+
+  it('rechecks monitor overlap when authorized users edit visit dates', async () => {
+    const repository = new FakeProjectsRepository();
+    repository.monitorAssignment = '00000000-0000-4000-8000-000000000102';
+    repository.monitorConflict = {
+      visitId: '00000000-0000-4000-8000-000000000498',
+      visitStartDate: '2026-10-19',
+      visitEndDate: '2026-10-21',
+    };
+    const service = projectsService(repository);
+    await assert.rejects(
+      service.updateVisitDates(
+        actor(),
+        '00000000-0000-4000-8000-000000000401',
+        {
+          visitStartDate: '2026-10-20',
+          visitEndDate: '2026-10-22',
+          reason: 'Approved schedule correction.',
+        },
+      ),
+      { status: 409 },
+    );
+  });
+
+  it('accepts single and multi-day visits and rejects reversed dates', async () => {
+    const service = projectsService(new FakeProjectsRepository());
+    const visitTypeId = '00000000-0000-4000-8000-000000000601';
+    await service.createVisit(actor(), project.id, {
+      visitTypeId,
+      visitStartDate: '2026-10-16',
+      visitEndDate: '2026-10-16',
+    });
+    const multi = await service.createVisit(actor(), project.id, {
+      visitTypeId,
+      visitStartDate: '2026-10-16',
+      visitEndDate: '2026-10-19',
+    });
+    assert.equal(multi.sponsorDeadlineDate, '2026-10-26');
+    await assert.rejects(
+      service.createVisit(actor(), project.id, {
+        visitTypeId,
+        visitStartDate: '2026-10-20',
+        visitEndDate: '2026-10-19',
+      }),
+      { status: 400 },
+    );
+  });
+
+  it('requires a complete date range and rejects inclusive monitor overlaps', async () => {
+    const repository = new FakeProjectsRepository();
+    const service = projectsService(repository);
+    const monitorUserId = '00000000-0000-4000-8000-000000000102';
+    const visitTypeId = '00000000-0000-4000-8000-000000000601';
+    await assert.rejects(
+      service.createVisit(actor(), project.id, {
+        visitTypeId,
+        monitorUserId,
+        visitStartDate: '2026-10-20',
+      }),
+      /start and end dates are required/i,
+    );
+    repository.monitorConflict = {
+      visitId: '00000000-0000-4000-8000-000000000499',
+      visitStartDate: '2026-10-18',
+      visitEndDate: '2026-10-20',
+    };
+    await assert.rejects(
+      service.createVisit(actor(), project.id, {
+        visitTypeId,
+        monitorUserId,
+        visitStartDate: '2026-10-20',
+        visitEndDate: '2026-10-22',
+      }),
+      (error: unknown) => {
+        const value = error as { status: number; message: string };
+        return (
+          value.status === 409 &&
+          value.message.includes('2026-10-18 to 2026-10-20')
+        );
+      },
+    );
+    repository.monitorConflict = null;
+    const nonOverlapping = await service.createVisit(actor(), project.id, {
+      visitTypeId,
+      monitorUserId,
+      visitStartDate: '2026-10-21',
+      visitEndDate: '2026-10-22',
+    });
+    assert.equal(nonOverlapping.visitSequence, 1);
+  });
+
+  it('audits a monitor reassignment once and rejects an unchanged assignment', async () => {
+    const repository = new FakeProjectsRepository();
+    const audit = new FakeAuditRepository();
+    const service = projectsService(repository, audit);
+    const monitorUserId = '00000000-0000-4000-8000-000000000102';
+    await service.updateVisitAssignment(
+      actor(),
+      '00000000-0000-4000-8000-000000000401',
+      { monitorUserId, reason: 'Approved coverage change.' },
+    );
+    assert.equal(repository.monitorAssignment, monitorUserId);
+    assert.equal(audit.events.length, 1);
+    assert.equal(audit.events[0]?.eventType, 'project_visit_monitor_changed');
+    await assert.rejects(
+      service.updateVisitAssignment(
+        actor(),
+        '00000000-0000-4000-8000-000000000401',
+        { monitorUserId, reason: 'No actual change.' },
+      ),
+      { status: 409 },
+    );
+    assert.equal(audit.events.length, 1);
+  });
+
+  it('serializes monitor scheduling and excludes cancelled visits in the repository', async () => {
+    const source = await readFile(
+      new URL('../../src/projects/projects.repository.ts', import.meta.url),
+      'utf8',
+    );
+    assert.match(source, /pg_advisory_xact_lock\(hashtextextended/);
+    assert.match(source, /visit_status<>'CANCELLED'/);
+    assert.match(
+      source,
+      /visit_start_date<=\$3::date AND visit_end_date>=\$2::date/,
+    );
+    assert.match(source, /MONITOR_VISIT_ASSIGNED/);
+    assert.match(source, /MONITOR_VISIT_REASSIGNED/);
+    assert.match(source, /MONITOR_VISIT_REMOVED/);
+  });
+
+  it('renders six role-scoped project subsections and keeps overdue color on status badges', async () => {
+    const portal = await readFile(
+      new URL('../../../web/components/projects-portal.tsx', import.meta.url),
+      'utf8',
+    );
+    for (const text of [
+      'Clients & Visit Types',
+      'Create Projects',
+      'Projects',
+      'Add Tracking Visit',
+      'Transfer Project',
+      'Tracking',
+    ])
+      assert.match(portal, new RegExp(text.replace('&', '&amp;|&')));
+    assert.doesNotMatch(portal, /className=\{row\.sponsorReportOverdue/);
+    assert.match(portal, /<Badge tone="error">Sponsor Report Overdue<\/Badge>/);
+  });
+
+  it('defines additive normalized-email and reviewed password-reset request storage', async () => {
+    const source = await readFile(
+      new URL(
+        '../../../../packages/database/migrations/1830000000000-stage-3-ui-scheduling-email-auth.cjs',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    assert.match(source, /lower\(btrim\(email\)\)/);
+    assert.match(source, /CREATE TABLE zenovel\.password_reset_requests/);
+    assert.match(source, /WHERE status='PENDING'/);
+    assert.doesNotMatch(source, /TRUNCATE|DROP TABLE zenovel\.users/i);
+  });
+
+  it('recalculates a corrected visit deadline from the end date and audits the history', async () => {
+    const repository = new FakeProjectsRepository();
+    const audit = new FakeAuditRepository();
+    const service = projectsService(repository, audit);
+    const result = await service.updateVisitDates(
+      actor(),
+      '00000000-0000-4000-8000-000000000401',
+      {
+        visitStartDate: '2026-10-17',
+        visitEndDate: '2026-10-20',
+        reason: 'Approved correction to the visit schedule.',
+      },
+    );
+    assert.equal(result.sponsorDeadlineDate, '2026-10-27');
+    assert.equal(audit.events[0]?.eventType, 'project_visit_dates_changed');
+    assert.equal(audit.events[0]?.context?.beforeDeadline, '2026-10-23');
+  });
+
+  it('defines normalized catalogue constraints, exact standard visit types, and additive relationships', async () => {
+    const source = await readFile(
+      new URL(
+        '../../../../packages/database/migrations/1820000000000-stage-3-project-tracking-enhancements.cjs',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    for (const value of [
+      'SIV',
+      'P01',
+      'P02',
+      'P03',
+      'P04',
+      'Parallel',
+      'IPBM',
+      'RTBM',
+      'SCV',
+      'QA Visit',
+    ])
+      assert.match(source, new RegExp(`'${value}'`));
+    assert.match(source, /CREATE TABLE zenovel\.visit_types/);
+    assert.match(source, /CREATE TABLE zenovel\.clients/);
+    assert.match(source, /UNIQUE\(normalized_name\)/);
+    assert.match(source, /UNIQUE\(normalized_code\)/);
+    assert.match(source, /visit_end_date >= visit_start_date/);
+    assert.match(source, /CREATE TABLE zenovel\.project_visit_date_history/);
+    assert.doesNotMatch(source, /TRUNCATE|DROP TABLE zenovel\.projects/i);
+  });
+
   it('supports multiple visits and calculates each deadline independently', async () => {
     const repository = new FakeProjectsRepository();
     const service = projectsService(repository);
     const first = await service.createVisit(actor(), project.id, {
-      visitType: 'SIV',
+      visitTypeId: '00000000-0000-4000-8000-000000000601',
       visitEndDate: '2026-10-16',
     });
     const second = await service.createVisit(actor(), project.id, {
-      visitType: 'Periodic Visit',
+      visitTypeId: '00000000-0000-4000-8000-000000000601',
       visitEndDate: '2026-10-19',
     });
     assert.equal(first.visitSequence, 1);
@@ -788,8 +1337,7 @@ describe('Stage 3 real HTTP authorization guards', () => {
         .send({
           inHouseProjectId: 'ZEN-HTTP-001',
           sponsorProjectId: 'SP-HTTP-001',
-          sponsorName: 'HTTP Test Sponsor',
-          clientCode: 'HTTP-CLIENT',
+          clientId: project.clientId,
           title: 'Validated HTTP project',
           receiptDate: '2026-10-16',
           pmUserId: project.pmUserId,
@@ -883,6 +1431,8 @@ describe('Stage 3 real HTTP authorization guards', () => {
       authConfig,
     );
     const create = mock.fn(async () => ({ id: project.id }));
+    const createVisitType = mock.fn(async () => ({ id: 'not-called' }));
+    const createClient = mock.fn(async () => ({ id: 'not-called' }));
     const guardConfig = new ConfigService<Environment, true>({
       CORS_ORIGINS: ['http://localhost:3000'],
       SESSION_COOKIE_NAME: 'zenovel_session',
@@ -890,7 +1440,10 @@ describe('Stage 3 real HTTP authorization guards', () => {
     const module = await Test.createTestingModule({
       controllers: [ProjectsController],
       providers: [
-        { provide: ProjectsService, useValue: { create } },
+        {
+          provide: ProjectsService,
+          useValue: { create, createVisitType, createClient },
+        },
         { provide: AuthService, useValue: auth },
         { provide: ConfigService, useValue: guardConfig },
         AuthorizationService,
@@ -913,6 +1466,22 @@ describe('Stage 3 real HTTP authorization guards', () => {
         .send({})
         .expect(403);
       assert.equal(create.mock.callCount(), 0);
+      await request(app.getHttpServer())
+        .post('/api/v1/projects/visit-types')
+        .set('Cookie', 'zenovel_session=isolated-pm-project-session')
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', csrf)
+        .send({ displayName: 'Unauthorized Type' })
+        .expect(403);
+      await request(app.getHttpServer())
+        .post('/api/v1/projects/clients')
+        .set('Cookie', 'zenovel_session=isolated-pm-project-session')
+        .set('Origin', 'http://localhost:3000')
+        .set('X-CSRF-Token', csrf)
+        .send({ name: 'Unauthorized Client', code: 'NO-01' })
+        .expect(403);
+      assert.equal(createVisitType.mock.callCount(), 0);
+      assert.equal(createClient.mock.callCount(), 0);
     } finally {
       await app.close();
     }

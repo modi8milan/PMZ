@@ -73,12 +73,16 @@ try {
       '1790000000000-auth-access-control',
       '1800000000000-stage-2-audit-role-refinement',
       '1810000000000-stage-3-project-tracking',
+      '1820000000000-stage-3-project-tracking-enhancements',
+      '1830000000000-stage-3-ui-scheduling-email-auth',
     ];
     const expectedTables = [
+      'clients',
       'departments',
       'mfa_recovery_codes',
       'notifications',
       'password_history',
+      'password_reset_requests',
       'password_reset_tokens',
       'permissions',
       'project_assignments',
@@ -87,6 +91,7 @@ try {
       'project_ownership_transfers',
       'project_status_history',
       'project_timeline_overrides',
+      'project_visit_date_history',
       'project_visits',
       'projects',
       'role_permissions',
@@ -95,6 +100,7 @@ try {
       'sessions',
       'user_roles',
       'users',
+      'visit_types',
       'working_calendar_days',
     ];
     if (

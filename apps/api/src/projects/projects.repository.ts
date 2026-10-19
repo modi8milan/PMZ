@@ -1,10 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import type { PoolClient } from 'pg';
+import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service.js';
 import type {
   CreateProjectDto,
+  CreateClientDto,
   CreateVisitDto,
+  CreateVisitTypeDto,
   ProjectQueryDto,
   TrackerQueryDto,
 } from './projects.dto.js';
@@ -14,6 +16,8 @@ import type {
   ProjectRow,
   ProjectStatus,
   TrackerRow,
+  ClientRow,
+  VisitTypeRow,
 } from './projects.types.js';
 
 type ProjectCreated = { id: string; serialNo: string };
@@ -25,13 +29,31 @@ type AssignmentResult = {
 type VisitDeadline = {
   id: string;
   projectId: string;
+  visitStartDate: string | null;
   visitEndDate: string | null;
   sponsorTimelineWorkingDays: number;
   sponsorDeadlineDate: string | null;
+  monitorUserId: string | null;
+  visitStatus?: string;
 };
 
+export type MonitorConflict = {
+  visitId: string;
+  visitStartDate: string;
+  visitEndDate: string;
+};
+
+function scheduleConflictError(
+  conflict: MonitorConflict,
+): Error & { code: string; conflict: MonitorConflict } {
+  return Object.assign(new Error('Monitor scheduling conflict.'), {
+    code: 'MONITOR_SCHEDULE_CONFLICT',
+    conflict,
+  });
+}
+
 const projectColumns = `p.id,p.serial_no::text AS "serialNo",p.in_house_project_id AS "inHouseProjectId",
-  p.sponsor_project_id AS "sponsorProjectId",p.sponsor_name AS "sponsorName",p.client_code AS "clientCode",
+  p.sponsor_project_id AS "sponsorProjectId",COALESCE(c.name,p.sponsor_name) AS "sponsorName",COALESCE(c.code,p.client_code) AS "clientCode",p.client_id AS "clientId",
   p.title,p.project_detail AS "projectDetail",p.regulatory_submission_details AS "regulatorySubmissionDetails",
   p.cro_name AS "croName",p.clinical_site AS "clinicalSite",
   p.bioanalytical_facility AS "bioanalyticalFacility",p.receipt_date::text AS "receiptDate",
@@ -51,7 +73,7 @@ function filters(query: ProjectQueryDto, start = 3) {
   };
   if (query.sponsor)
     add(
-      `(p.sponsor_name ILIKE '%'||?||'%' OR p.client_code ILIKE '%'||?||'%')`,
+      `(COALESCE(c.name,p.sponsor_name) ILIKE '%'||?||'%' OR COALESCE(c.code,p.client_code) ILIKE '%'||?||'%')`,
       query.sponsor,
     );
   if (query.projectId)
@@ -91,6 +113,108 @@ export class ProjectsRepository {
     return result.rows;
   }
 
+  async visitTypes(includeInactive = false): Promise<VisitTypeRow[]> {
+    const result = await this.db.query<VisitTypeRow>(
+      `SELECT t.id,t.display_name AS "displayName",t.active,
+       EXISTS(SELECT 1 FROM zenovel.project_visits v WHERE v.visit_type_id=t.id) AS "inUse"
+       FROM zenovel.visit_types t WHERE ($1::boolean OR t.active=true)
+       ORDER BY t.active DESC,t.display_name`,
+      [includeInactive],
+    );
+    return result.rows;
+  }
+
+  async activeVisitType(id: string) {
+    const result = await this.db.query<{ id: string; displayName: string }>(
+      `SELECT id,display_name AS "displayName" FROM zenovel.visit_types WHERE id=$1 AND active=true`,
+      [id],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async createVisitType(input: CreateVisitTypeDto, actorId: string) {
+    const result = await this.db.query<VisitTypeRow>(
+      `INSERT INTO zenovel.visit_types(id,display_name,normalized_name,created_by,updated_by)
+       VALUES($1,$2::varchar,lower(trim($2::text)),$3,$3)
+       RETURNING id,display_name AS "displayName",active,false AS "inUse"`,
+      [randomUUID(), input.displayName, actorId],
+    );
+    return result.rows[0]!;
+  }
+
+  async updateVisitType(
+    id: string,
+    input: { displayName?: string; active?: boolean },
+    actorId: string,
+  ) {
+    const result = await this.db.query<VisitTypeRow>(
+      `UPDATE zenovel.visit_types SET
+       display_name=COALESCE($2::varchar,display_name),
+       normalized_name=CASE WHEN $2::text IS NULL THEN normalized_name ELSE lower(trim($2::text)) END,
+       active=COALESCE($3,active),updated_by=$4,updated_at=now()
+       WHERE id=$1
+       RETURNING id,display_name AS "displayName",active,
+       EXISTS(SELECT 1 FROM zenovel.project_visits v WHERE v.visit_type_id=visit_types.id) AS "inUse"`,
+      [id, input.displayName ?? null, input.active ?? null, actorId],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async clients(includeInactive = false): Promise<ClientRow[]> {
+    const result = await this.db.query<ClientRow>(
+      `SELECT c.id,c.name,c.code,c.active,
+       EXISTS(SELECT 1 FROM zenovel.projects p WHERE p.client_id=c.id) AS "inUse"
+       FROM zenovel.clients c WHERE ($1::boolean OR c.active=true)
+       ORDER BY c.active DESC,c.name,c.code`,
+      [includeInactive],
+    );
+    return result.rows;
+  }
+
+  async activeClient(id: string) {
+    const result = await this.db.query<{
+      id: string;
+      name: string;
+      code: string;
+    }>('SELECT id,name,code FROM zenovel.clients WHERE id=$1 AND active=true', [
+      id,
+    ]);
+    return result.rows[0] ?? null;
+  }
+
+  async createClient(input: CreateClientDto, actorId: string) {
+    const result = await this.db.query<ClientRow>(
+      `INSERT INTO zenovel.clients(id,name,code,normalized_name,normalized_code,created_by,updated_by)
+       VALUES($1,$2::varchar,$3::varchar,lower(trim($2::text)),lower(trim($3::text)),$4,$4)
+       RETURNING id,name,code,active,false AS "inUse"`,
+      [randomUUID(), input.name, input.code, actorId],
+    );
+    return result.rows[0]!;
+  }
+
+  async updateClient(
+    id: string,
+    input: { name?: string; code?: string; active?: boolean },
+    actorId: string,
+  ) {
+    const result = await this.db.query<ClientRow>(
+      `UPDATE zenovel.clients SET name=COALESCE($2::varchar,name),code=COALESCE($3::varchar,code),
+       normalized_name=CASE WHEN $2::text IS NULL THEN normalized_name ELSE lower(trim($2::text)) END,
+       normalized_code=CASE WHEN $3::text IS NULL THEN normalized_code ELSE lower(trim($3::text)) END,
+       active=COALESCE($4,active),updated_by=$5,updated_at=now()
+       WHERE id=$1 RETURNING id,name,code,active,
+       EXISTS(SELECT 1 FROM zenovel.projects p WHERE p.client_id=clients.id) AS "inUse"`,
+      [
+        id,
+        input.name ?? null,
+        input.code ?? null,
+        input.active ?? null,
+        actorId,
+      ],
+    );
+    return result.rows[0] ?? null;
+  }
+
   async isEligible(userId: string, role: string): Promise<boolean> {
     const result = await this.db.query(
       `SELECT 1 FROM zenovel.users u JOIN zenovel.user_roles ur ON ur.user_id=u.id
@@ -104,21 +228,27 @@ export class ProjectsRepository {
   async create(
     input: CreateProjectDto,
     actorId: string,
-  ): Promise<ProjectCreated> {
+  ): Promise<ProjectCreated | null> {
     return this.db.transaction(async (client) => {
+      const selectedClient = await client.query<{ name: string; code: string }>(
+        'SELECT name,code FROM zenovel.clients WHERE id=$1 AND active=true',
+        [input.clientId],
+      );
+      if (!selectedClient.rows[0]) return null;
       const id = randomUUID();
       const project = await client.query<ProjectCreated>(
         `INSERT INTO zenovel.projects
-        (id,in_house_project_id,sponsor_project_id,sponsor_name,client_code,title,project_detail,regulatory_submission_details,cro_name,
+        (id,in_house_project_id,sponsor_project_id,sponsor_name,client_code,client_id,title,project_detail,regulatory_submission_details,cro_name,
          clinical_site,bioanalytical_facility,receipt_date,tentative_start_date,category,pm_user_id,provisional_monitor_id,created_by)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
         RETURNING id,serial_no::text AS "serialNo"`,
         [
           id,
           input.inHouseProjectId,
           input.sponsorProjectId,
-          input.sponsorName,
-          input.clientCode,
+          selectedClient.rows[0].name,
+          selectedClient.rows[0].code,
+          input.clientId,
           input.title,
           input.projectDetail ?? null,
           input.regulatorySubmissionDetails ?? null,
@@ -173,8 +303,9 @@ export class ProjectsRepository {
     const result = await this.db.query<ProjectRow & { totalCount: string }>(
       `SELECT ${projectColumns},count(v.id)::integer AS "visitCount",count(*) OVER()::text AS "totalCount"
        FROM zenovel.projects p LEFT JOIN zenovel.users pm ON pm.id=p.pm_user_id
-       LEFT JOIN zenovel.users mon ON mon.id=p.provisional_monitor_id LEFT JOIN zenovel.project_visits v ON v.project_id=p.id
-       WHERE ${where} GROUP BY p.id,pm.full_name,mon.full_name
+       LEFT JOIN zenovel.users mon ON mon.id=p.provisional_monitor_id LEFT JOIN zenovel.clients c ON c.id=p.client_id
+       LEFT JOIN zenovel.project_visits v ON v.project_id=p.id
+       WHERE ${where} GROUP BY p.id,pm.full_name,mon.full_name,c.name,c.code
        ORDER BY ${sort} ${query.direction === 'desc' ? 'DESC' : 'ASC'},p.serial_no ASC
        LIMIT $${limitIndex} OFFSET $${limitIndex + 1}`,
       values,
@@ -194,8 +325,9 @@ export class ProjectsRepository {
     const result = await this.db.query<ProjectRow>(
       `SELECT ${projectColumns},count(v.id)::integer AS "visitCount"
        FROM zenovel.projects p LEFT JOIN zenovel.users pm ON pm.id=p.pm_user_id
-       LEFT JOIN zenovel.users mon ON mon.id=p.provisional_monitor_id LEFT JOIN zenovel.project_visits v ON v.project_id=p.id
-       WHERE ${accessSql} AND p.id=$3::uuid GROUP BY p.id,pm.full_name,mon.full_name`,
+       LEFT JOIN zenovel.users mon ON mon.id=p.provisional_monitor_id LEFT JOIN zenovel.clients c ON c.id=p.client_id
+       LEFT JOIN zenovel.project_visits v ON v.project_id=p.id
+       WHERE ${accessSql} AND p.id=$3::uuid GROUP BY p.id,pm.full_name,mon.full_name,c.name,c.code`,
       [access.organizationWide, access.userId, projectId],
     );
     return result.rows[0] ?? null;
@@ -351,6 +483,7 @@ export class ProjectsRepository {
     input: CreateVisitDto,
     actorId: string,
     deadline: string | null,
+    visitTypeName: string,
   ) {
     return this.db.transaction(async (client) => {
       const locked = await client.query(
@@ -358,25 +491,45 @@ export class ProjectsRepository {
         [projectId],
       );
       if (!locked.rows[0]) return null;
+      if (
+        input.monitorUserId &&
+        (input.visitStatus ?? 'PLANNED') !== 'CANCELLED' &&
+        input.visitStartDate &&
+        input.visitEndDate
+      ) {
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))',
+          [input.monitorUserId],
+        );
+        const conflict = await this.monitorConflict(
+          client,
+          input.monitorUserId,
+          input.visitStartDate,
+          input.visitEndDate,
+        );
+        if (conflict) throw scheduleConflictError(conflict);
+      }
       const id = randomUUID();
       const result = await client.query<{ id: string; visitSequence: number }>(
         `INSERT INTO zenovel.project_visits
-         (id,project_id,visit_sequence,visit_type,visit_status,report_status,capa_status,monitor_user_id,agenda_shared,
-          visit_end_date,visit_end_recorded_at,report_from_monitor,sponsor_approval,mfr_to_cro,capa_from_cro,capa_received_date,study_result,
+         (id,project_id,visit_sequence,visit_type,visit_type_id,visit_status,report_status,capa_status,monitor_user_id,agenda_shared,
+          visit_start_date,visit_end_date,visit_end_recorded_at,report_from_monitor,sponsor_approval,mfr_to_cro,capa_from_cro,capa_received_date,study_result,
           source_documents_status,qms_archival_submission,comments,final_archival_date,sponsor_deadline_date,created_by)
-         SELECT $1,$2,COALESCE(max(visit_sequence),0)+1,$3,$4,$5,$6,$7,$8,$9,
-          CASE WHEN $9::date IS NULL THEN NULL ELSE now() END,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21
+         SELECT $1,$2,COALESCE(max(visit_sequence),0)+1,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+          CASE WHEN $11::date IS NULL THEN NULL ELSE now() END,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
          FROM zenovel.project_visits WHERE project_id=$2
          RETURNING id,visit_sequence AS "visitSequence"`,
         [
           id,
           projectId,
-          input.visitType,
+          visitTypeName,
+          input.visitTypeId,
           input.visitStatus ?? 'PLANNED',
           input.reportStatus ?? 'NOT_STARTED',
           input.capaStatus ?? 'NOT_APPLICABLE',
           input.monitorUserId ?? null,
           input.agendaShared ?? false,
+          input.visitStartDate ?? null,
           input.visitEndDate ?? null,
           input.reportFromMonitor ?? null,
           input.sponsorApproval ?? null,
@@ -392,6 +545,21 @@ export class ProjectsRepository {
           actorId,
         ],
       );
+      if (input.monitorUserId) {
+        const identity = await client.query<{ inHouseProjectId: string }>(
+          'SELECT in_house_project_id AS "inHouseProjectId" FROM zenovel.projects WHERE id=$1',
+          [projectId],
+        );
+        await this.notify(
+          client,
+          input.monitorUserId,
+          'MONITOR_VISIT_ASSIGNED',
+          projectId,
+          id,
+          `You were assigned visit ${result.rows[0]!.visitSequence} for ${identity.rows[0]?.inHouseProjectId ?? 'a project'} (${input.visitStartDate ?? 'date pending'} to ${input.visitEndDate ?? 'date pending'}).`,
+          `/projects/${projectId}`,
+        );
+      }
       return result.rows[0]!;
     });
   }
@@ -436,8 +604,9 @@ export class ProjectsRepository {
     const result = await this.db.query<TrackerRow & { totalCount: string }>(
       `SELECT ${projectColumns},count(*) OVER()::text AS "totalCount",1::integer AS "visitCount",
        v.id AS "visitId",v.visit_sequence AS "visitSequence",v.visit_type AS "visitType",v.visit_status AS "visitStatus",
-       v.report_status AS "reportStatus",v.capa_status AS "capaStatus",vm.full_name AS "monitorName",v.agenda_shared AS "agendaShared",
-       v.report_from_monitor AS "reportFromMonitor",
+       v.visit_type_id AS "visitTypeId",
+       v.report_status AS "reportStatus",v.capa_status AS "capaStatus",v.monitor_user_id AS "monitorUserId",vm.full_name AS "monitorName",v.agenda_shared AS "agendaShared",
+       v.report_from_monitor AS "reportFromMonitor",v.visit_start_date::text AS "visitStartDate",
        v.visit_end_date::text AS "visitEndDate",v.visit_end_recorded_at AS "visitEndRecordedAt",
        v.first_draft_submitted_at AS "firstDraftSubmittedAt",v.report_shared_to_sponsor_at AS "reportSharedToSponsorAt",
        v.signed_report_shared_at AS "signedReportSharedAt",v.sponsor_approval AS "sponsorApproval",v.mfr_to_cro AS "mfrToCro",
@@ -447,6 +616,7 @@ export class ProjectsRepository {
        v.sponsor_deadline_date::text AS "sponsorDeadlineDate",v.sponsor_report_overdue AS "sponsorReportOverdue",
        v.deviation_required AS "deviationRequired",v.deviation_reported AS "deviationReported"
        FROM zenovel.projects p JOIN zenovel.project_visits v ON v.project_id=p.id
+       LEFT JOIN zenovel.clients c ON c.id=p.client_id
        LEFT JOIN zenovel.users pm ON pm.id=p.pm_user_id LEFT JOIN zenovel.users mon ON mon.id=p.provisional_monitor_id
        LEFT JOIN zenovel.users vm ON vm.id=v.monitor_user_id
        WHERE ${[accessSql, ...selected.clauses].join(' AND ')}
@@ -463,12 +633,204 @@ export class ProjectsRepository {
 
   async visitForUpdate(visitId: string): Promise<VisitDeadline | null> {
     const result = await this.db.query<VisitDeadline>(
-      `SELECT id,project_id AS "projectId",visit_end_date::text AS "visitEndDate",
-       sponsor_timeline_working_days AS "sponsorTimelineWorkingDays",sponsor_deadline_date::text AS "sponsorDeadlineDate"
+      `SELECT id,project_id AS "projectId",visit_start_date::text AS "visitStartDate",visit_end_date::text AS "visitEndDate",
+       sponsor_timeline_working_days AS "sponsorTimelineWorkingDays",sponsor_deadline_date::text AS "sponsorDeadlineDate",
+       monitor_user_id AS "monitorUserId",visit_status AS "visitStatus"
        FROM zenovel.project_visits WHERE id=$1`,
       [visitId],
     );
     return result.rows[0] ?? null;
+  }
+
+  async updateVisitDates(
+    visitId: string,
+    startDate: string | null,
+    endDate: string | null,
+    deadline: string | null,
+    actorId: string,
+    reason: string,
+  ) {
+    return this.db.transaction(async (client) => {
+      const current = await client.query<VisitDeadline>(
+        `SELECT id,project_id AS "projectId",visit_start_date::text AS "visitStartDate",
+         visit_end_date::text AS "visitEndDate",sponsor_timeline_working_days AS "sponsorTimelineWorkingDays",
+         sponsor_deadline_date::text AS "sponsorDeadlineDate",monitor_user_id AS "monitorUserId",visit_status AS "visitStatus"
+         FROM zenovel.project_visits WHERE id=$1 FOR UPDATE`,
+        [visitId],
+      );
+      const previous = current.rows[0];
+      if (!previous) return null;
+      if (
+        previous.monitorUserId &&
+        previous.visitStatus !== 'CANCELLED' &&
+        startDate &&
+        endDate
+      ) {
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))',
+          [previous.monitorUserId],
+        );
+        const conflict = await this.monitorConflict(
+          client,
+          previous.monitorUserId,
+          startDate,
+          endDate,
+          visitId,
+        );
+        if (conflict) throw scheduleConflictError(conflict);
+      }
+      await client.query(
+        `UPDATE zenovel.project_visits SET visit_start_date=$2,visit_end_date=$3,
+         visit_end_recorded_at=CASE WHEN $3::date IS NULL THEN NULL ELSE COALESCE(visit_end_recorded_at,now()) END,
+         sponsor_deadline_date=$4,updated_at=now() WHERE id=$1`,
+        [visitId, startDate, endDate, deadline],
+      );
+      await client.query(
+        `INSERT INTO zenovel.project_visit_date_history
+         (id,visit_id,previous_start_date,new_start_date,previous_end_date,new_end_date,
+          previous_deadline_date,new_deadline_date,actor_user_id,reason)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [
+          randomUUID(),
+          visitId,
+          previous.visitStartDate,
+          startDate,
+          previous.visitEndDate,
+          endDate,
+          previous.sponsorDeadlineDate,
+          deadline,
+          actorId,
+          reason,
+        ],
+      );
+      return previous;
+    });
+  }
+
+  async availability(
+    monitorUserId: string,
+    startDate: string,
+    endDate: string,
+    excludeVisitId?: string,
+  ): Promise<MonitorConflict | null> {
+    return this.monitorConflict(
+      this.db,
+      monitorUserId,
+      startDate,
+      endDate,
+      excludeVisitId,
+    );
+  }
+
+  private async monitorConflict(
+    queryable: {
+      query<T extends QueryResultRow = QueryResultRow>(
+        text: string,
+        values?: unknown[],
+      ): Promise<QueryResult<T>>;
+    },
+    monitorUserId: string,
+    startDate: string,
+    endDate: string,
+    excludeVisitId?: string,
+  ): Promise<MonitorConflict | null> {
+    const result = await queryable.query<MonitorConflict>(
+      `SELECT id AS "visitId",visit_start_date::text AS "visitStartDate",
+       visit_end_date::text AS "visitEndDate" FROM zenovel.project_visits
+       WHERE monitor_user_id=$1 AND visit_status<>'CANCELLED'
+       AND visit_start_date IS NOT NULL AND visit_end_date IS NOT NULL
+       AND visit_start_date<=$3::date AND visit_end_date>=$2::date
+       AND ($4::uuid IS NULL OR id<>$4::uuid)
+       ORDER BY visit_start_date LIMIT 1`,
+      [monitorUserId, startDate, endDate, excludeVisitId ?? null],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async updateVisitMonitor(
+    visitId: string,
+    monitorUserId: string | null,
+    actorId: string,
+    reason: string,
+  ) {
+    return this.db.transaction(async (client) => {
+      const current = await client.query<{
+        projectId: string;
+        previousMonitorId: string | null;
+        visitSequence: number;
+        visitStartDate: string | null;
+        visitEndDate: string | null;
+        visitStatus: string;
+        inHouseProjectId: string;
+      }>(
+        `SELECT v.project_id AS "projectId",v.monitor_user_id AS "previousMonitorId",
+         v.visit_sequence AS "visitSequence",v.visit_start_date::text AS "visitStartDate",
+         v.visit_end_date::text AS "visitEndDate",v.visit_status AS "visitStatus",
+         p.in_house_project_id AS "inHouseProjectId"
+         FROM zenovel.project_visits v JOIN zenovel.projects p ON p.id=v.project_id
+         WHERE v.id=$1 FOR UPDATE OF v`,
+        [visitId],
+      );
+      const row = current.rows[0];
+      if (!row) return null;
+      if (row.previousMonitorId === monitorUserId)
+        return { ...row, unchanged: true };
+      const locks = [
+        ...new Set(
+          [row.previousMonitorId, monitorUserId].filter(Boolean) as string[],
+        ),
+      ].sort();
+      for (const id of locks)
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))',
+          [id],
+        );
+      if (
+        monitorUserId &&
+        row.visitStatus !== 'CANCELLED' &&
+        row.visitStartDate &&
+        row.visitEndDate
+      ) {
+        const conflict = await this.monitorConflict(
+          client,
+          monitorUserId,
+          row.visitStartDate,
+          row.visitEndDate,
+          visitId,
+        );
+        if (conflict) throw scheduleConflictError(conflict);
+      }
+      await client.query(
+        'UPDATE zenovel.project_visits SET monitor_user_id=$2,updated_at=now() WHERE id=$1',
+        [visitId, monitorUserId],
+      );
+      const range = `${row.visitStartDate ?? 'date pending'} to ${row.visitEndDate ?? 'date pending'}`;
+      if (row.previousMonitorId)
+        await this.notify(
+          client,
+          row.previousMonitorId,
+          'MONITOR_VISIT_REMOVED',
+          row.projectId,
+          visitId,
+          `You were removed from visit ${row.visitSequence} for ${row.inHouseProjectId} (${range}).`,
+          `/projects/${row.projectId}`,
+        );
+      if (monitorUserId)
+        await this.notify(
+          client,
+          monitorUserId,
+          row.previousMonitorId
+            ? 'MONITOR_VISIT_REASSIGNED'
+            : 'MONITOR_VISIT_ASSIGNED',
+          row.projectId,
+          visitId,
+          `You were assigned visit ${row.visitSequence} for ${row.inHouseProjectId} (${range}).`,
+          `/projects/${row.projectId}`,
+        );
+      void actorId;
+      void reason;
+      return { ...row, newMonitorId: monitorUserId, unchanged: false };
+    });
   }
 
   async overrideTimeline(

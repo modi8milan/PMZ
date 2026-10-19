@@ -1,4 +1,5 @@
 import {
+  IsEmail,
   IsOptional,
   IsString,
   Matches,
@@ -20,7 +21,7 @@ export class ChangePasswordDto {
   @IsOptional() @IsString() @MaxLength(32) recoveryCode?: string;
 }
 export class RecoveryRequestDto {
-  @IsString() @MinLength(1) @MaxLength(100) username!: string;
+  @IsEmail() @MaxLength(254) email!: string;
 }
 export class ResetPasswordDto {
   @IsString({ message: 'User ID is required.' })

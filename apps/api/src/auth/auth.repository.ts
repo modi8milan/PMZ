@@ -78,10 +78,29 @@ export class AuthRepository {
 
   async findUserByUsername(username: string): Promise<AuthUser | null> {
     const result = await this.db.query<UserRow>(
-      'SELECT * FROM zenovel.users WHERE lower(username) = lower($1)',
+      `WITH readiness AS (
+        SELECT NOT EXISTS (
+          SELECT 1 FROM zenovel.users
+          WHERE status='active' AND (email IS NULL OR btrim(email)='' OR
+            email !~* '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$')
+        ) AS email_ready
+      )
+      SELECT u.* FROM zenovel.users u CROSS JOIN readiness r
+      WHERE (r.email_ready AND lower(btrim(u.email))=lower(btrim($1)))
+         OR (NOT r.email_ready AND lower(u.username)=lower(btrim($1)))`,
       [username],
     );
     return result.rows[0] ? this.mapUser(result.rows[0]) : null;
+  }
+  async loginMode(): Promise<'email' | 'username'> {
+    const result = await this.db.query<{ ready: boolean }>(
+      `SELECT NOT EXISTS (
+        SELECT 1 FROM zenovel.users
+        WHERE status='active' AND (email IS NULL OR btrim(email)='' OR
+          email !~* '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$')
+      ) AS ready`,
+    );
+    return result.rows[0]?.ready ? 'email' : 'username';
   }
   async findUserById(id: string): Promise<AuthUser | null> {
     const result = await this.db.query<UserRow>(
@@ -241,7 +260,15 @@ export class AuthRepository {
       const token = await client.query<{ id: string; user_id: string }>(
         `SELECT t.id,t.user_id FROM zenovel.password_reset_tokens t
         JOIN zenovel.users u ON u.id=t.user_id
-        WHERE t.token_hash=$1 AND lower(u.username)=lower($2)
+        CROSS JOIN (SELECT NOT EXISTS (
+          SELECT 1 FROM zenovel.users ready_user
+          WHERE ready_user.status='active' AND (ready_user.email IS NULL OR btrim(ready_user.email)='' OR
+            ready_user.email !~* '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$')
+        ) AS email_ready) readiness
+        WHERE t.token_hash=$1 AND (
+          (readiness.email_ready AND lower(btrim(u.email))=lower(btrim($2))) OR
+          (NOT readiness.email_ready AND lower(u.username)=lower(btrim($2)))
+        )
         AND t.used_at IS NULL AND t.expires_at > now() FOR UPDATE OF t`,
         [tokenHashValue, username],
       );
@@ -279,11 +306,53 @@ export class AuthRepository {
     const result = await this.db.query<UserRow>(
       `SELECT u.* FROM zenovel.password_reset_tokens t
       JOIN zenovel.users u ON u.id=t.user_id
-      WHERE t.token_hash=$1 AND lower(u.username)=lower($2)
+      CROSS JOIN (SELECT NOT EXISTS (
+        SELECT 1 FROM zenovel.users ready_user
+        WHERE ready_user.status='active' AND (ready_user.email IS NULL OR btrim(ready_user.email)='' OR
+          ready_user.email !~* '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$')
+      ) AS email_ready) readiness
+      WHERE t.token_hash=$1 AND (
+        (readiness.email_ready AND lower(btrim(u.email))=lower(btrim($2))) OR
+        (NOT readiness.email_ready AND lower(u.username)=lower(btrim($2)))
+      )
       AND t.used_at IS NULL AND t.expires_at>now()`,
       [tokenHashValue, username],
     );
     return result.rows[0] ? this.mapUser(result.rows[0]) : null;
+  }
+
+  async requestPasswordReset(
+    email: string,
+    ipHash?: string,
+  ): Promise<string | null> {
+    return this.db.transaction(async (client) => {
+      const user = await client.query<{ id: string }>(
+        `SELECT id FROM zenovel.users
+         WHERE status='active' AND lower(btrim(email))=lower(btrim($1))`,
+        [email],
+      );
+      const userId = user.rows[0]?.id;
+      if (!userId) return null;
+      const id = randomUUID();
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO zenovel.password_reset_requests(id,user_id,source_ip_hash)
+         VALUES($1,$2,$3) ON CONFLICT (user_id) WHERE status='PENDING' DO NOTHING
+         RETURNING id`,
+        [id, userId, ipHash ?? null],
+      );
+      if (!inserted.rows[0]) return userId;
+      await client.query(
+        `INSERT INTO zenovel.notifications
+         (id,recipient_user_id,notification_type,message,action_path,priority)
+         SELECT gen_random_uuid(),u.id,'PASSWORD_RESET_REQUESTED',
+           'A password reset request is awaiting administrator review.',
+           '/admin/users','HIGH'
+         FROM zenovel.users u JOIN zenovel.user_roles ur ON ur.user_id=u.id
+         JOIN zenovel.roles r ON r.id=ur.role_id
+         WHERE u.status='active' AND r.active=true AND r.code='SYSTEM_ADMINISTRATOR'`,
+      );
+      return userId;
+    });
   }
 
   async setMfaSecret(userId: string, encrypted: string): Promise<void> {

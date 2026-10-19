@@ -26,6 +26,7 @@ import {
   UpdateDepartmentDto,
   UpdateRoleDto,
   UpdateUserDto,
+  ProcessResetRequestDto,
 } from './admin.dto.js';
 
 @Controller('admin')
@@ -46,6 +47,18 @@ export class AdminController {
   }
   @Get('users') users() {
     return this.admin.users();
+  }
+  @Get('password-reset-requests') resetRequests() {
+    return this.admin.resetRequests();
+  }
+  @Post('password-reset-requests/:id') processResetRequest(
+    @Param('id') id: string,
+    @Body() body: ProcessResetRequestDto,
+    @Req() request: AuthenticatedRequest,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const c = this.context(request, response);
+    return this.admin.processResetRequest(c.actorId, id, body, c.requestId);
   }
   @Post('users') createUser(
     @Body() body: CreateUserDto,
